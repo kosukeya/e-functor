@@ -57,7 +57,7 @@ class MultiHeadSelfAttention(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model)
         self.o_proj = nn.Linear(d_model, d_model)
 
-    def forward(self, x, need_weights=False):
+    def forward(self, x, attn_mask=None, need_weights=False):
         B, T, D = x.shape
         H, Dh = self.n_heads, self.d_head
 
@@ -66,6 +66,12 @@ class MultiHeadSelfAttention(nn.Module):
         v = self.v_proj(x).view(B, T, H, Dh).transpose(1, 2)
 
         scores = torch.matmul(q, k.transpose(-2, -1)) / (Dh ** 0.5)
+
+        if attn_mask is not None:
+            if attn_mask.shape != scores.shape:
+                raise ValueError(f"attn_mask shape {attn_mask.shape} must match scores {scores.shape}")
+            scores = attn_mask.to(dtype=scores.dtype, device=scores.device).add_(scores)
+
         attn = torch.softmax(scores, dim=-1)           # (B,H,T,T)
         out = torch.matmul(attn, v)                    # (B,H,T,Dh)
 
@@ -123,7 +129,20 @@ class MultiIWorldModel(nn.Module):
         # [plant, sun, water, I1, I2, I3, growth]
         x = torch.cat([p, s, w, I1, I2, I3, g], dim=1)      # (B,7,D)
 
-        x_out, attn = self.attn(x, need_weights=True)       # attn:(B,H,7,7)
+        # Attention mask (下三角 + I 限定参照):
+        #   - env 同士は時間方向の下三角（未来禁止）
+        #   - I1-3 は env(plant,sun,water) のみ参照可
+        #   - growth は過去/現在のみ参照可（下三角）
+        T = x.size(1)
+        base = torch.zeros((T, T), device=x.device, dtype=x.dtype)
+        upper = torch.triu(torch.ones((T, T), device=x.device), diagonal=1).bool()
+        base = base.masked_fill(upper, float("-inf"))
+        base[3:6, :] = float("-inf")
+        base[3:6, 0:3] = 0.0
+
+        attn_mask = base.unsqueeze(0).unsqueeze(0).expand(B, self.attn.n_heads, T, T).clone()
+
+        x_out, attn = self.attn(x, attn_mask=attn_mask, need_weights=True)       # attn:(B,H,7,7)
 
         # semantic / meaning ブランチ
         growth_sem_rep  = x_out[:, 6, :]                    # growth token
