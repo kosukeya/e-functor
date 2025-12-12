@@ -104,6 +104,12 @@ class MultiIWorldModel(nn.Module):
         self.head_sem = nn.Linear(d_model, 1)
         # 統計ブランチ用 head（env 平均から）
         self.head_stat = nn.Linear(d_model, 1)
+        # 逆向き head（growth token から env を推定）
+        self.head_reverse = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.Tanh(),
+            nn.Linear(d_model, 3),
+        )
 
     def forward(self, plant, sun, water,
                 return_attn=False, return_both=False):
@@ -144,6 +150,23 @@ class MultiIWorldModel(nn.Module):
 
         # デフォルトは semantic 出力
         return growth_sem_pred
+
+    def reverse_from_growth(self, batch_size, device=None):
+        """
+        growth トークンのみを残し、他トークンをゼロ埋めした入力から
+        env (plant, sun, water) を逆推定するヘッド。
+        """
+        if device is None:
+            device = self.growth_token.device
+
+        g = self.growth_token.expand(batch_size, -1, -1).to(device=device)
+        zeros_env = torch.zeros(batch_size, 6, self.d_model, device=device, dtype=g.dtype)
+        x_rev = torch.cat([zeros_env, g], dim=1)
+
+        x_rev_out, _ = self.attn(x_rev, need_weights=False)
+        growth_rev_rep = x_rev_out[:, 6, :]
+        reverse_raw = self.head_reverse(growth_rev_rep)
+        return reverse_raw
 
 class FStatWrapper(nn.Module):
     """
@@ -462,6 +485,7 @@ fstat = FStatWrapper(model, tau=0.02, scale=2.0)
 λ_real_base = 1.0
 λ_self      = 1.0   # self-loop 正則化の重み（αとは独立）
 λ_sem       = 0.1  # ★ semantic ブランチ用の弱い MSE
+λ_reverse   = 0.01  # growth→env 逆向き head への負の学習率（小さめ）
 
 self_target = 0.03  # growth_self への注意の望ましい上限（要調整）
 
@@ -498,6 +522,15 @@ for epoch in range(2001):
     H_I   = entropy_I_attention(attn)
     L_env = env_attention_penalty(attn, alpha=0.3)
 
+    # growth token のみを残した入力から env を再構成する逆向き head。
+    # 介入データ (do(sun=0), do(plant=0)) をターゲットにしつつ、
+    # その精度を下げるように負の重みで学習。
+    p, s, w = train_data[:3]
+    reverse_pred = model.reverse_from_growth(batch_size=p.size(0), device=device)
+    env_do_s = torch.stack([p, torch.zeros_like(s), w], dim=-1)
+    env_do_p = torch.stack([torch.zeros_like(p), s, w], dim=-1)
+    L_reverse = 0.5 * (F.mse_loss(reverse_pred, env_do_s) + F.mse_loss(reverse_pred, env_do_p))
+
     # self-loop 正則化
     self_mass = self_attention_mass_from_attn(attn)
     L_self = torch.relu(self_mass - self_target)
@@ -512,6 +545,7 @@ for epoch in range(2001):
         - λ_ent_eff  * H_I
         + λ_env_eff  * L_env
         + λ_self * L_self
+        - λ_reverse * L_reverse
     )
 
 
@@ -542,6 +576,7 @@ for epoch in range(2001):
             f"H_I={H_I.item():.4f} "
             f"L_env={L_env.item():.4f} "
             f"L_self={L_self.item():.4f} "
+            f"L_rev={L_reverse.item():.4f} "
             f"self_mass={self_mass.item():.4f} "
             f"Val_sem={val_L_sem.item():.4f}"
         )
