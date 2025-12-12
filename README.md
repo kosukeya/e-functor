@@ -1,2 +1,2 @@
 # e-functor
-to study machine learning
+圏論の考え方をニューラルネットに応用し、理解を深める。
