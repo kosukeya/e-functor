@@ -545,10 +545,26 @@ for epoch in range(2001):
     # 介入データ (do(sun=0), do(plant=0)) をターゲットにしつつ、
     # その精度を下げるように負の重みで学習。
     p, s, w = train_data[:3]
+    # --- reverse head: growth から env(do) を再構成しようとする能力を「一定以上なら抑制」する（A案） ---
     reverse_pred = model.reverse_from_growth(batch_size=p.size(0), device=device)
+
+    # 介入ターゲット
     env_do_s = torch.stack([p, torch.zeros_like(s), w], dim=-1)
     env_do_p = torch.stack([torch.zeros_like(p), s, w], dim=-1)
-    L_reverse = 0.5 * (F.mse_loss(reverse_pred, env_do_s) + F.mse_loss(reverse_pred, env_do_p))
+
+    # 監視用：各介入ターゲットへの MSE（reduction="mean"）
+    mse_s = F.mse_loss(reverse_pred, env_do_s)
+    mse_p = F.mse_loss(reverse_pred, env_do_p)
+    mse = 0.5 * (mse_s + mse_p)
+
+    # A案：MSE が margin 未満のときだけ「もっと外せ（= mse を増やせ）」という圧をかける
+    # mse が margin を超えたら 0 になり、発散で稼げない
+    rev_margin = 1.0  # まずは 0.5, 1.0, 2.0 で試すのがおすすめ
+    L_reverse = torch.relu(rev_margin - mse)
+
+    # 監視用：reverse_pred の発散検知
+    rev_abs_mean = reverse_pred.abs().mean()
+    rev_std = reverse_pred.std()
 
     # self-loop 正則化
     self_mass = self_attention_mass_from_attn(attn)
@@ -564,7 +580,7 @@ for epoch in range(2001):
         - λ_ent_eff  * H_I
         + λ_env_eff  * L_env
         + λ_self * L_self
-        - λ_reverse * L_reverse
+        + λ_reverse * L_reverse
     )
 
 
@@ -596,6 +612,8 @@ for epoch in range(2001):
             f"L_env={L_env.item():.4f} "
             f"L_self={L_self.item():.4f} "
             f"L_rev={L_reverse.item():.4f} "
+            f"mse_s={mse_s.item():.4f} mse_p={mse_p.item():.4f} mse={mse.item():.4f} "
+            f"rev_abs_mean={rev_abs_mean.item():.4f} rev_std={rev_std.item():.4f} "
             f"self_mass={self_mass.item():.4f} "
             f"Val_sem={val_L_sem.item():.4f}"
         )
