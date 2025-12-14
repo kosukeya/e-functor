@@ -44,7 +44,10 @@ def main():
     plt.ylim(0, 1.0)
     plt.title("Avg attention from [growth] query")
     plt.tight_layout()
-    plt.show()
+
+    out_path = "attn_bar.png"
+    plt.savefig(out_path, dpi=150)
+    print(f"\nSaved figure to: {out_path}")
 
 if __name__ == "__main__":
     main()
