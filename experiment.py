@@ -3,6 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
+# ---- Collapse guards (minimal) ----
+LAMBDA_SEM_MIN = 0.20   # semantic回帰の下限（αに依らず確保）
+CF_HINGE_MARGIN = 1e-3  # 反事実 hinge のマージン
+LOGSPACE_EPS = 1e-8     # log-space用
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print("device:", device)
 
@@ -153,7 +158,7 @@ class MultiIWorldModel(nn.Module):
         # semantic / meaning ブランチ
         growth_sem_rep  = x_out[:, 6, :]                    # growth token
         growth_sem_raw  = self.head_sem(growth_sem_rep).squeeze(-1)
-        growth_sem_pred = F.softplus(growth_sem_raw)
+        growth_sem_pred = F.softplus(growth_sem_raw) + 1e-6
 
         # statistical ブランチ
         env_reps  = x_out[:, 0:3, :]                        # plant,sun,water
@@ -276,6 +281,16 @@ def env_attention_penalty(attn, alpha=0.3):
     penalty = torch.relu(alpha - env_sum)
     return penalty.mean()
 
+def cf_hinge_loss(y, margin=1e-3):
+    # loss = E[ relu(|y|-m)^2 ]
+    return (torch.relu(torch.abs(y) - margin) ** 2).mean()
+
+def loss_real_sem_log(model, data, eps=LOGSPACE_EPS):
+    p, s, w, y = data
+    _, y_sem, _, _ = model(p, s, w, return_both=True)
+    return F.mse_loss(torch.log(y_sem + eps), torch.log(y + eps))
+
+
 # === ここから self 関連のヘルパー ===
 
 def self_attention_mass_from_attn(attn):
@@ -328,8 +343,7 @@ def loss_counterfactual_sun0_sem(model, data):
     y_stat, y_sem, _, _ = model(p, s0, w, return_both=True)
 
     # 「sun=0 なら成長してはいけない」は semantic 側にだけ要求
-    return (y_sem ** 2).mean()
-
+    return cf_hinge_loss(y_sem, margin=CF_HINGE_MARGIN)
 
 def loss_counterfactual_plant0_sem(model, data):
     """
@@ -339,8 +353,7 @@ def loss_counterfactual_plant0_sem(model, data):
     p0 = torch.zeros_like(p)
 
     y_stat, y_sem, _, _ = model(p0, s, w, return_both=True)
-    return (y_sem ** 2).mean()
-
+    return cf_hinge_loss(y_sem, margin=CF_HINGE_MARGIN)
 
 def loss_monotonic_sun_sem(model, device, n_pairs=64):
     """
@@ -489,6 +502,72 @@ def epsilon_to_alpha(epsilon, k=5.0):
     eps_clipped = max(min(epsilon, 1.0), -1.0)
     return 1.0 / (1.0 + math.exp(-k * eps_clipped))
 
+# =============================
+# 監視ログ用ヘルパー（学習には使わない）
+# =============================
+@torch.no_grad()
+def pearson_corr(a, b, eps=1e-8):
+    """
+    a,b: (B,)  torch tensor
+    """
+    a = a.view(-1)
+    b = b.view(-1)
+    a0 = a - a.mean()
+    b0 = b - b.mean()
+    denom = (a0.std(unbiased=False) * b0.std(unbiased=False) + eps)
+    return (a0 * b0).mean() / denom
+
+@torch.no_grad()
+def semantic_health_metrics(model, data, device):
+    """
+    semantic ブランチの健全性をまとめて返す（ログ専用）
+    - mean/std
+    - corr(y_sem, y_true)
+    - CF gap / ratio
+    - attention: env_sum / I_sum / self_mass / H_I
+    """
+    p, s, w, y = data
+
+    # y_sem (real)
+    _, y_sem, attn, _ = model(p, s, w, return_both=True)
+    y_sem = y_sem.detach()
+    y_mean = float(y_sem.mean().item())
+    y_std  = float(y_sem.std(unbiased=False).item())
+    y_min  = float(y_sem.min().item())
+    y_max  = float(y_sem.max().item())
+    corr   = float(pearson_corr(y_sem, y).item())
+
+    # counterfactual means (semantic only)
+    s0 = torch.zeros_like(s)
+    p0 = torch.zeros_like(p)
+    _, y_sem_s0, _, _ = model(p, s0, w, return_both=True)
+    _, y_sem_p0, _, _ = model(p0, s, w, return_both=True)
+    m_real = float(y_sem.mean().item())
+    m_s0   = float(y_sem_s0.mean().item())
+    m_p0   = float(y_sem_p0.mean().item())
+
+    gap_s = m_real - m_s0
+    gap_p = m_real - m_p0
+    ratio_s = m_s0 / (m_real + 1e-8)
+    ratio_p = m_p0 / (m_real + 1e-8)
+    # attention summary
+    attn_mean = attn.mean(dim=1).mean(dim=0)   # (7,7)
+    g_row = attn_mean[6]                       # (7,)
+    env_sum  = float(g_row[0:3].sum().item())
+    I_sum    = float(g_row[3:6].sum().item())
+    self_m   = float(g_row[6].item())
+    H_I_val  = float(entropy_I_attention(attn).item())
+
+    return {
+        "y_mean": y_mean, "y_std": y_std, "y_min": y_min, "y_max": y_max,
+        "corr": corr,
+        "m_real": m_real, "m_s0": m_s0, "m_p0": m_p0,
+        "gap_s": gap_s, "gap_p": gap_p,
+        "ratio_s": ratio_s, "ratio_p": ratio_p,
+        "env_sum": env_sum, "I_sum": I_sum, "self_m": self_m,
+        "H_I": H_I_val,
+    }
+
 # -----------------------------
 # 5. 学習ループ（F2 + L_self）
 # -----------------------------
@@ -530,7 +609,7 @@ for epoch in range(2001):
 
     # NEW: semantic ブランチ単独のデータフィット（弱い責任）
     # alpha=1.0 で y_pred = y_sem になることを利用
-    L_real_sem, _, _ = loss_real_with_attn_F2(model, train_data, alpha=1.0)
+    L_real_sem = loss_real_sem_log(model, train_data)
 
     # 反事実・単調性・I 構造（semantic ブランチにのみ課す）
     L_cf_s = loss_counterfactual_sun0_sem(model, train_data)
@@ -570,10 +649,12 @@ for epoch in range(2001):
     self_mass = self_attention_mass_from_attn(attn)
     L_self = torch.relu(self_mass - self_target)
 
+    λ_sem_eff = max(LAMBDA_SEM_MIN, λ_sem * alpha)
+
     # 全体 loss
     loss = (
         λ_real_eff * L_real_mix         # F2 混合出力の MSE
-        + λ_sem      * L_real_sem       # ★ semantic 用の弱い MSE
+        + λ_sem_eff  * L_real_sem       # ★ semantic 用の弱い MSE
         + λ_cf_eff   * (L_cf_s + L_cf_p)
         + λ_mono_eff * L_mono
         + λ_cos_eff  * L_cos
@@ -582,8 +663,6 @@ for epoch in range(2001):
         + λ_self * L_self
         + λ_reverse * L_reverse
     )
-
-
 
     loss.backward()
     opt.step()
@@ -599,7 +678,11 @@ for epoch in range(2001):
     if epoch % 200 == 0:
         model.eval()
         with torch.no_grad():
-            val_L_sem, _, _ = loss_real_with_attn_F2(model, val_data, alpha=1.0)
+            val_L_sem = loss_real_sem_log(model, val_data)
+            # 監視（train/val）
+            mon_tr  = semantic_health_metrics(model, train_data, device)
+            mon_val = semantic_health_metrics(model, val_data, device)
+
 
         print(
             f"[{epoch}] "
@@ -616,6 +699,28 @@ for epoch in range(2001):
             f"rev_abs_mean={rev_abs_mean.item():.4f} rev_std={rev_std.item():.4f} "
             f"self_mass={self_mass.item():.4f} "
             f"Val_sem={val_L_sem.item():.4f}"
+        )
+
+        # ---- 追加：semantic 崩壊監視ログ（学習には未使用）----
+        print(
+            f"   [MON-TR] y_mean={mon_tr['y_mean']:.4f} y_std={mon_tr['y_std']:.4f} "
+            f"y_min={mon_tr['y_min']:.4f} y_max={mon_tr['y_max']:.4f} "
+            f"corr={mon_tr['corr']:.4f} "
+            f"m_real={mon_tr['m_real']:.4f} m_s0={mon_tr['m_s0']:.4f} m_p0={mon_tr['m_p0']:.4f} "
+            f"gap_s={mon_tr['gap_s']:.4f} gap_p={mon_tr['gap_p']:.4f} "
+            f"ratio_s={mon_tr['ratio_s']:.4f} ratio_p={mon_tr['ratio_p']:.4f} "
+            f"env_sum={mon_tr['env_sum']:.4f} I_sum={mon_tr['I_sum']:.4f} self={mon_tr['self_m']:.4f} "
+            f"H_I={mon_tr['H_I']:.4f}"
+        )
+        print(
+            f"   [MON-VA] y_mean={mon_val['y_mean']:.4f} y_std={mon_val['y_std']:.4f} "
+            f"y_min={mon_val['y_min']:.4f} y_max={mon_val['y_max']:.4f} "
+            f"corr={mon_val['corr']:.4f} "
+            f"m_real={mon_val['m_real']:.4f} m_s0={mon_val['m_s0']:.4f} m_p0={mon_val['m_p0']:.4f} "
+            f"gap_s={mon_val['gap_s']:.4f} gap_p={mon_val['gap_p']:.4f} "
+            f"ratio_s={mon_val['ratio_s']:.4f} ratio_p={mon_val['ratio_p']:.4f} "
+            f"env_sum={mon_val['env_sum']:.4f} I_sum={mon_val['I_sum']:.4f} self={mon_val['self_m']:.4f} "
+            f"H_I={mon_val['H_I']:.4f}"
         )
 
 
