@@ -29,6 +29,64 @@ def append_row_csv(path, fieldnames, row_dict):
             w.writeheader()
         w.writerow(row_dict)
 
+# -----------------------------
+# extra logging helpers (minimal)
+# -----------------------------
+_EPS = 1e-8
+@torch.no_grad()
+def _pearson_corr(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> float:
+    a = a.view(-1)
+    b = b.view(-1)
+    a0 = a - a.mean()
+    b0 = b - b.mean()
+    denom = (a0.std(unbiased=False) * b0.std(unbiased=False) + eps)
+    return float(((a0 * b0).mean() / denom).item())
+
+@torch.no_grad()
+def branch_log_dict(model: MultiIWorldModel, data, alpha: float, device) -> dict:
+    """
+    y_stat / y_sem のログ（反事実・相関・寄与率）をまとめて返す
+    """
+    p, s, w, y = data
+
+    y_stat, y_sem, _, _ = model(p, s, w, return_both=True)
+    y_mix = (1.0 - alpha) * y_stat + alpha * y_sem
+    # counterfactual (sun=0 / plant=0)
+    s0 = torch.zeros_like(s)
+    p0 = torch.zeros_like(p)
+    y_stat_s0, y_sem_s0, _, _ = model(p, s0, w, return_both=True)
+    y_stat_p0, y_sem_p0, _, _ = model(p0, s, w, return_both=True)
+    y_mix_s0 = (1.0 - alpha) * y_stat_s0 + alpha * y_sem_s0
+    y_mix_p0 = (1.0 - alpha) * y_stat_p0 + alpha * y_sem_p0
+
+    # correlations (real)
+    corr_stat = _pearson_corr(y_stat, y)
+    corr_sem  = _pearson_corr(y_sem, y)
+    corr_mix  = _pearson_corr(y_mix, y)
+
+    # contribution ratio (mean abs contribution)
+    c_stat = ((1.0 - alpha) * y_stat).abs().mean()
+    c_sem  = (alpha * y_sem).abs().mean()
+    contrib_sem = float((c_sem / (c_stat + c_sem + _EPS)).item())
+    contrib_stat = 1.0 - contrib_sem
+
+    return {
+        "y_stat_mean": float(y_stat.mean().item()),
+        "y_sem_mean":  float(y_sem.mean().item()),
+        "y_mix_mean":  float(y_mix.mean().item()),
+        "corr_stat": corr_stat,
+        "corr_sem":  corr_sem,
+        "corr_mix":  corr_mix,
+        "cf_s0_stat_mean": float(y_stat_s0.mean().item()),
+        "cf_s0_sem_mean":  float(y_sem_s0.mean().item()),
+        "cf_s0_mix_mean":  float(y_mix_s0.mean().item()),
+        "cf_p0_stat_mean": float(y_stat_p0.mean().item()),
+        "cf_p0_sem_mean":  float(y_sem_p0.mean().item()),
+        "cf_p0_mix_mean":  float(y_mix_p0.mean().item()),
+        "contrib_stat": contrib_stat,
+        "contrib_sem":  contrib_sem,
+    }
+
 def main():
     print("device:", C.device)
 
@@ -114,6 +172,9 @@ def main():
                 val_L_sem = loss_real_sem_log(model, val_data)
                 mon_tr  = semantic_health_metrics(model, train_data, C.device)
                 mon_val = semantic_health_metrics(model, val_data, C.device)
+                # NEW: y_stat/y_sem logs (uses current alpha)
+                alpha_used = float(alpha)
+                br = branch_log_dict(model, train_data, alpha=alpha_used, device=C.device)
 
             print(
                 f"[{epoch}] "
@@ -163,11 +224,15 @@ def main():
                     w_cf=1.0, w_mono=1.0, w_att=1.0, w_self=1.0, sym_att=True,
                 )
                 epsilon_val = eps_info["epsilon"]
-                alpha = epsilon_to_alpha(epsilon_val, k=C.ALPHA_K)
+                alpha_next = float(epsilon_to_alpha(epsilon_val, k=C.ALPHA_K))
+                alpha = alpha_next
 
                 row = {
                     "epoch": epoch,
-                    "alpha": alpha,
+                    # alpha used for the logged forward (this epoch)
+                    "alpha_used": alpha_used,
+                    # alpha updated by epsilon gate (for next epochs)
+                    "alpha": alpha_next,
                     "epsilon": epsilon_val,
                     "dC": eps_info["dC"],
                     "dM": eps_info["dM"],
@@ -188,6 +253,8 @@ def main():
                     "I_sum_val": float(mon_val["I_sum"]),
                     "self_m_val": float(mon_val["self_m"]),
                     "corr_val": float(mon_val["corr"]),
+                    # NEW: branch logs
+                    **br,
                 }
                 fields = list(row.keys())
                 append_row_csv(LOG_PATH, fields, row)
