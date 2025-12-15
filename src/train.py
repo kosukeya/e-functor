@@ -40,7 +40,9 @@ def append_row_csv(path, fieldnames, row_dict):
         w = csv.DictWriter(f, fieldnames=fieldnames)
         if not exists:
             w.writeheader()
-        w.writerow(row_dict)
+        # ★余計なキーは捨てる（ここが重要）
+        safe = {k: row_dict.get(k, "") for k in fieldnames}
+        w.writerow(safe)
 
 # -----------------------------
 # extra logging helpers (minimal)
