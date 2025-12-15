@@ -15,6 +15,20 @@ from losses import (
 )
 from metrics import semantic_health_metrics, epsilon_between_models, epsilon_to_alpha
 
+import csv
+from pathlib import Path
+
+LOG_PATH = Path("runs") / "alpha_log.csv"
+LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+def append_row_csv(path, fieldnames, row_dict):
+    exists = path.exists()
+    with path.open("a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        if not exists:
+            w.writeheader()
+        w.writerow(row_dict)
+
 def main():
     print("device:", C.device)
 
@@ -150,6 +164,33 @@ def main():
                 )
                 epsilon_val = eps_info["epsilon"]
                 alpha = epsilon_to_alpha(epsilon_val, k=C.ALPHA_K)
+
+                row = {
+                    "epoch": epoch,
+                    "alpha": alpha,
+                    "epsilon": epsilon_val,
+                    "dC": eps_info["dC"],
+                    "dM": eps_info["dM"],
+                    "d_cf": eps_info["d_cf"],
+                    "d_mono": eps_info["d_mono"],
+                    "d_att": eps_info["d_att"],
+                    "d_self": eps_info["d_self"],
+                    "self_f": eps_info["self_f"],
+                    "self_g": eps_info["self_g"],
+                    "Val_sem": float(val_L_sem.item()),
+                    "self_mass": float(self_mass.item()),
+                    # あると便利（semantic_health_metrics の結果）
+                    "env_sum_tr": float(mon_tr["env_sum"]),
+                    "I_sum_tr": float(mon_tr["I_sum"]),
+                    "self_m_tr": float(mon_tr["self_m"]),
+                    "corr_tr": float(mon_tr["corr"]),
+                    "env_sum_val": float(mon_val["env_sum"]),
+                    "I_sum_val": float(mon_val["I_sum"]),
+                    "self_m_val": float(mon_val["self_m"]),
+                    "corr_val": float(mon_val["corr"]),
+                }
+                fields = list(row.keys())
+                append_row_csv(LOG_PATH, fields, row)
 
                 print(
                     f"   dC={eps_info['dC']:.6f} "
