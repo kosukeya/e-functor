@@ -26,8 +26,12 @@ LOG_FIELDS = [
   "self_f","self_g","Val_sem","self_mass",
   "env_sum_tr","I_sum_tr","self_m_tr","corr_tr",
   "env_sum_val","I_sum_val","self_m_val","corr_val",
-  # 追加ログを alpha_log に入れるならここに追記していく
-  # 例: "corr_stat","corr_sem","corr_mix","cf_s0_stat",... etc
+  "alpha_used",
+  "y_stat_mean","y_sem_mean","y_mix_mean",
+  "corr_stat","corr_sem","corr_mix",
+  "cf_s0_stat_mean","cf_s0_sem_mean","cf_s0_mix_mean",
+  "cf_p0_stat_mean","cf_p0_sem_mean","cf_p0_mix_mean",
+  "contrib_stat","contrib_sem",
 ]
 
 def append_row_csv(path, fieldnames, row_dict):
