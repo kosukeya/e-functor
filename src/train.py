@@ -21,6 +21,15 @@ from pathlib import Path
 LOG_PATH = Path("runs") / "alpha_log.csv"
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+LOG_FIELDS = [
+  "epoch","alpha","epsilon","dC","dM","d_cf","d_mono","d_att","d_self",
+  "self_f","self_g","Val_sem","self_mass",
+  "env_sum_tr","I_sum_tr","self_m_tr","corr_tr",
+  "env_sum_val","I_sum_val","self_m_val","corr_val",
+  # 追加ログを alpha_log に入れるならここに追記していく
+  # 例: "corr_stat","corr_sem","corr_mix","cf_s0_stat",... etc
+]
+
 def append_row_csv(path, fieldnames, row_dict):
     exists = path.exists()
     with path.open("a", newline="") as f:
@@ -256,9 +265,10 @@ def main():
                     # NEW: branch logs
                     **br,
                 }
-                fields = list(row.keys())
-                append_row_csv(LOG_PATH, fields, row)
-
+                for k in LOG_FIELDS:
+                    row.setdefault(k, "")
+                append_row_csv(LOG_PATH, LOG_FIELDS, row)
+                
                 print(
                     f"   dC={eps_info['dC']:.6f} "
                     f"d_cf={eps_info['d_cf']:.6f} "
