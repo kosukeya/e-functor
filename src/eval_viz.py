@@ -24,7 +24,7 @@ def main():
     model.load_state_dict(torch.load("model_last.pt", map_location=C.device))
     model.eval()
 
-    p_tr, s_tr, w_tr, _ = train_data
+    p_tr, s_tr, w_tr, y_tr = train_data
 
     alpha = getattr(C, "ALPHA_EVAL", 0.5)  # なくてもOK。無ければ0.5で表示。
     with torch.no_grad():
