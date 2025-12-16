@@ -80,6 +80,11 @@ def _ensure_labels(snap, k=2, use_attn=True, seed=0):
     else:
         X = np.asarray(I)
 
+    # ★追加：I が (N,3,D) なら (N, 3D) に潰す
+    if X.ndim == 3:
+        X = X.reshape(X.shape[0], -1)
+
+
     if use_attn:
         attn = snap["attn"]
         if attn is None:
@@ -185,6 +190,9 @@ def run_island_eps(
     # labels & features for prev
     prev_lab = _ensure_labels(prev, k=k, use_attn=use_attn)
     prev_I = prev["I"].detach().cpu().numpy() if isinstance(prev["I"], torch.Tensor) else np.asarray(prev["I"])
+    if prev_I.ndim == 3:
+        prev_I = prev_I.reshape(prev_I.shape[0], -1)
+
     prev_A = prev["attn"].detach().cpu().numpy() if use_attn and isinstance(prev["attn"], torch.Tensor) else (np.asarray(prev["attn"]) if use_attn else None)
     prev_X = np.concatenate([prev_I, prev_A], axis=1) if use_attn else prev_I
 
@@ -192,6 +200,9 @@ def run_island_eps(
         cur_lab = _ensure_labels(cur, k=k, use_attn=use_attn)
 
         cur_I = cur["I"].detach().cpu().numpy() if isinstance(cur["I"], torch.Tensor) else np.asarray(cur["I"])
+        if cur_I.ndim == 3:
+            cur_I = cur_I.reshape(cur_I.shape[0], -1)
+
         cur_A = cur["attn"].detach().cpu().numpy() if use_attn and isinstance(cur["attn"], torch.Tensor) else (np.asarray(cur["attn"]) if use_attn else None)
         cur_X = np.concatenate([cur_I, cur_A], axis=1) if use_attn else cur_I
 
