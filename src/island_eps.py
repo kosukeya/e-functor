@@ -49,7 +49,7 @@ def _load_snapshot(pt_path: Path):
 
     # embedding / attn for label recompute fallback
     I = _get_any(snap, ["I_embed", "I", "I_emb", "I_embedding"], None)
-    attn = _get_any(snap, ["attn", "attn_mean", "attn_avg"], None)
+    attn = _get_any(snap, ["attn", "attn_growth_row", "attn_mean", "attn_avg"], None)
 
     return {
         "epoch": int(epoch),
