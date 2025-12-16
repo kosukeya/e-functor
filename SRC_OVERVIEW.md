@@ -45,5 +45,3 @@
 3. `python src/plot_alpha.py` で学習ログから α/ε などの推移グラフを生成。
 4. `python src/island_viz.py --use_attn` で island スナップショットをクラスタリングし、滞留時間やクラスタ別反事実差分を可視化。
 5. `python src/island_eps.py` でエポック間の島ごとの安定性 (ε, dM, dC) を計算し CSV にまとめる。
-
-この概要を README に取り込むことで、データ生成から学習・可視化までの一連の流れと各スクリプトの出力物を簡潔に把握できます。
