@@ -2,6 +2,7 @@
 import copy
 import torch
 import torch.nn.functional as F
+from typing import Dict, Any
 
 import config as C
 from data import generate_world_data, make_split, pack_data
@@ -17,6 +18,7 @@ from metrics import semantic_health_metrics, epsilon_between_models, epsilon_to_
 
 import csv
 from pathlib import Path
+import os
 
 LOG_PATH = Path("runs") / "alpha_log.csv"
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -101,6 +103,83 @@ def branch_log_dict(model: MultiIWorldModel, data, alpha: float, device) -> dict
         "contrib_stat": contrib_stat,
         "contrib_sem":  contrib_sem,
     }
+
+# =============================
+# Experiment 3: "Island" logging
+# =============================
+ISLAND_DIR = Path("runs") / "islands"
+ISLAND_DIR.mkdir(parents=True, exist_ok=True)
+
+# でかいログを避けるため、固定サブサンプルだけ保存（必要なら増やす）
+ISLAND_MAX_SAMPLES = int(os.environ.get("ISLAND_MAX_SAMPLES", "512"))
+# epoch % LOG_EVERY == 0 のタイミングで保存（必要なら環境変数で上書き）
+ISLAND_EVERY = int(os.environ.get("ISLAND_EVERY", str(C.LOG_EVERY)))
+
+@torch.no_grad()
+def save_island_snapshot(
+    model: MultiIWorldModel,
+    data,
+    epoch: int,
+    alpha_used: float,
+    device: str,
+    out_dir: Path = ISLAND_DIR,
+    max_samples: int = ISLAND_MAX_SAMPLES,
+) -> Path:
+    """
+    「島」可視化用ログ（I埋め込み + growth行attention + 予測/反事実）を
+    epochごとに1ファイルへ保存する。
+
+    保存形式: torch.save(dict) -> runs/islands/island_epochXXXXX.pt
+    """
+    p, s, w, y = data
+    B = p.size(0)
+    n = min(B, max_samples)
+
+    # 固定サブサンプル（先頭n）: まずは最小差分。
+    # 「ラン間再現性」を取りたいなら、固定seedでランダムindexを作って保存する方式に後で拡張。
+    p0 = p[:n]
+    s0 = s[:n]
+    w0 = w[:n]
+    y0 = y[:n]
+
+    # forward（stat/sem + attn + I）
+    y_stat, y_sem, attn, (I1, I2, I3) = model(p0, s0, w0, return_both=True)
+    y_mix = (1.0 - alpha_used) * y_stat + alpha_used * y_sem
+
+    # counterfactual（sun=0 / plant=0）: クラスタごとの差を見るために一緒に保存
+    z_s = torch.zeros_like(s0)
+    z_p = torch.zeros_like(p0)
+    y_stat_sun0, y_sem_sun0, _, _ = model(p0, z_s, w0, return_both=True)
+    y_stat_plt0, y_sem_plt0, _, _ = model(z_p, s0, w0, return_both=True)
+    y_mix_sun0 = (1.0 - alpha_used) * y_stat_sun0 + alpha_used * y_sem_sun0
+    y_mix_plt0 = (1.0 - alpha_used) * y_stat_plt0 + alpha_used * y_sem_plt0
+
+    # attention: growth query 行（head平均）→ (n, 7)
+    # attn: (B,H,7,7) なので head平均して行6を抜く
+    attn_grow = attn.mean(dim=1)[:, 6, :]  # (n,7)
+
+    payload: Dict[str, Any] = {
+        "epoch": int(epoch),
+        "alpha_used": float(alpha_used),
+        "env": torch.stack([p0, s0, w0], dim=-1).detach().cpu(),      # (n,3)
+        "y_true": y0.detach().cpu(),                                  # (n,)
+        "y_stat": y_stat.detach().cpu(),
+        "y_sem": y_sem.detach().cpu(),
+        "y_mix": y_mix.detach().cpu(),
+        "y_sun0_stat": y_stat_sun0.detach().cpu(),
+        "y_sun0_sem": y_sem_sun0.detach().cpu(),
+        "y_sun0_mix": y_mix_sun0.detach().cpu(),
+        "y_plant0_stat": y_stat_plt0.detach().cpu(),
+        "y_plant0_sem": y_sem_plt0.detach().cpu(),
+        "y_plant0_mix": y_mix_plt0.detach().cpu(),
+        "I": torch.cat([I1, I2, I3], dim=1).squeeze(2).detach().cpu()  # (n,3,D)
+             if I1.dim() == 3 else torch.stack([I1, I2, I3], dim=1).detach().cpu(),
+        "attn_growth_row": attn_grow.detach().cpu(),                  # (n,7)
+    }
+
+    out_path = out_dir / f"island_epoch{epoch:05d}.pt"
+    torch.save(payload, out_path)
+    return out_path
 
 def main():
     print("device:", C.device)
@@ -190,6 +269,17 @@ def main():
                 # NEW: y_stat/y_sem logs (uses current alpha)
                 alpha_used = float(alpha)
                 br = branch_log_dict(model, train_data, alpha=alpha_used, device=C.device)
+            
+            # Experiment 3: island snapshot（I埋め込み + attention行）
+            if epoch % ISLAND_EVERY == 0:
+                path = save_island_snapshot(
+                    model=model,
+                    data=train_data,
+                    epoch=epoch,
+                    alpha_used=alpha_used,
+                    device=C.device,
+                )
+                print(f"   [ISLAND] saved snapshot: {path}")
 
             print(
                 f"[{epoch}] "
