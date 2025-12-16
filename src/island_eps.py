@@ -257,6 +257,7 @@ def run_island_eps(
 
 if __name__ == "__main__":
     run_island_eps(
-        runs_dir="runs/islands",     # ★ここを追加
-        pattern="island_epoch*.pt",  # そのままでOK
+        runs_dir="runs",
+        pattern="islands/island_epoch*.pt",  # ★ここだけ変更
     )
+
