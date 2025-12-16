@@ -175,6 +175,17 @@ def save_island_snapshot(
         "I": torch.cat([I1, I2, I3], dim=1).squeeze(2).detach().cpu()  # (n,3,D)
              if I1.dim() == 3 else torch.stack([I1, I2, I3], dim=1).detach().cpu(),
         "attn_growth_row": attn_grow.detach().cpu(),                  # (n,7)
+        # ★追加：island_eps.py が探す個別データキー
+        "plant": p0.detach().cpu(),
+        "sun":   s0.detach().cpu(),
+        "water": w0.detach().cpu(),
+        "growth": y0.detach().cpu(),
+
+        # ★追加：island_eps.py が探す attn キー（既存の attn_growth_row の別名）
+        "attn": attn_grow.detach().cpu(),
+
+        # ★追加：island_eps.py が探す model_state
+        "model_state": copy.deepcopy(model.state_dict()),
     }
 
     out_path = out_dir / f"island_epoch{epoch:05d}.pt"
