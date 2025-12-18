@@ -7,7 +7,7 @@ from sklearn.metrics import accuracy_score
 
 import matplotlib.pyplot as plt
 
-CSV_PATH = "island_env_error.csv"  # 必要ならパス変更
+CSV_PATH = "runs/island_env_error.csv"  # 必要ならパス変更
 
 
 def fit_stump_by_epoch(df: pd.DataFrame, feature="err_abs_mean", target="island"):
