@@ -63,18 +63,37 @@ def safe_numeric_cols(df: pd.DataFrame, exclude=("epoch",)):
             cols.append(c)
     return cols
 
-def loo_prob_predictions(model, X, y):
-    """Leave-One-Out で predict_proba を集める（小標本前提）"""
-    n = X.shape[0]
-    prob = np.full(n, np.nan, dtype=float)
-    pred = np.full(n, -999, dtype=int)
+def loo_prob_predictions(model, X, y, pos_label=1):
+    """
+    LOOで確率予測を返す。train側が単一クラスになるfoldは、
+    そのクラスで確定予測にフォールバックする。
+    """
+    n = len(y)
+    prob = np.zeros(n, dtype=float)
+    pred = np.zeros(n, dtype=int)
+
     for i in range(n):
-        idx_tr = np.array([j for j in range(n) if j != i])
-        idx_te = np.array([i])
-        model.fit(X[idx_tr], y[idx_tr])
-        p = model.predict_proba(X[idx_te])[0, 1]
-        prob[i] = p
-        pred[i] = int(p >= 0.5)
+        idx_te = i
+        idx_tr = np.array([j for j in range(n) if j != i], dtype=int)
+
+        y_tr = y[idx_tr]
+        uniq = np.unique(y_tr)
+
+        if len(uniq) < 2:
+            # trainが単一クラス → そのクラスで確定
+            c = int(uniq[0])
+            pred[idx_te] = c
+            prob[idx_te] = 1.0 if c == pos_label else 0.0
+            continue
+
+        model.fit(X[idx_tr], y_tr)
+        p = model.predict_proba(X[idx_te:idx_te+1])[0]
+        # pos_label の列を取る（pos_labelが1でない場合も安全に）
+        classes = model.classes_
+        pos_idx = int(np.where(classes == pos_label)[0][0])
+        prob[idx_te] = p[pos_idx]
+        pred[idx_te] = int(prob[idx_te] >= 0.5)
+
     return prob, pred
 
 def loo_pred_multiclass(model, X, y):
