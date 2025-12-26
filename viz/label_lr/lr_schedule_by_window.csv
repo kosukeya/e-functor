@@ -1,0 +1,7 @@
+epoch_start,epoch_end,cluster,agree_frac,is_event_window,lr_mult
+200,1000,1,0.8,True,1.5
+400,1200,2,0.8,True,1.5
+600,1400,0,0.8,True,0.75
+800,1600,0,1.0,True,0.75
+1000,1800,0,1.0,False,0.75
+1200,2000,0,1.0,False,0.75

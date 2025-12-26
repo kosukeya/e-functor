@@ -1,0 +1,4 @@
+cluster,n_windows,event_windows,event_rate,mean_agree,lr_mult
+0,4,2,0.5,0.95,0.75
+1,1,1,1.0,0.8,1.5
+2,1,1,1.0,0.8,1.5
