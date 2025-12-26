@@ -20,6 +20,8 @@ import csv
 from pathlib import Path
 import os
 
+from lr_by_epoch import LrByEpochSchedule
+
 LOG_PATH = Path("runs") / "alpha_log.csv"
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -201,13 +203,29 @@ def main():
     val_data   = pack_data(plant, sun, water, growth, val_idx, C.device)
 
     model = MultiIWorldModel(d_model=C.D_MODEL, n_heads=C.N_HEADS).to(C.device)
+    
     opt = torch.optim.Adam(model.parameters(), lr=C.LR)
+
+    # ★追加：クラスタ条件付きLR（外部CSVでepoch→lr_multを引く）
+    # 例: runs/run1/lr_mult_by_epoch.csv を手で用意しておく（解析スクリプトの出力）
+    LR_TABLE = os.environ.get("/content/runs/run1/lr_mult_by_epoch.csv", "")
+    lr_sched = None
+    if LR_TABLE:
+        lr_sched = LrByEpochSchedule(LR_TABLE, default_mult=1.0)
+        print(f"[LR] using lr schedule table: {LR_TABLE}")
+
     fstat = FStatWrapper(model, device=C.device, tau=C.EMA_TAU, scale=C.FSTAT_SCALE)
 
     prev_state = None
     alpha = 0.5
 
     for epoch in range(C.EPOCHS):
+        # ★追加：epoch開始時にLRを更新
+        if lr_sched is not None:
+            mult = lr_sched.lr_mult(epoch)
+            for pg in opt.param_groups:
+                pg["lr"] = C.LR * mult
+
         model.train()
         opt.zero_grad()
 
