@@ -19,6 +19,8 @@ from metrics import semantic_health_metrics, epsilon_between_models, epsilon_to_
 import csv
 from pathlib import Path
 import os
+import math
+import pandas as pd
 
 from lr_by_epoch import LrByEpochSchedule
 
@@ -208,23 +210,69 @@ def main():
 
     # ★追加：クラスタ条件付きLR（外部CSVでepoch→lr_multを引く）
     # 例: runs/run1/lr_mult_by_epoch.csv を手で用意しておく（解析スクリプトの出力）
-    LR_TABLE = os.environ.get("/content/runs/run1/lr_mult_by_epoch.csv", "")
-    lr_sched = None
-    if LR_TABLE:
-        lr_sched = LrByEpochSchedule(LR_TABLE, default_mult=1.0)
-        print(f"[LR] using lr schedule table: {LR_TABLE}")
+    DEFAULT_LR_TABLE = "runs/run1/lr_mult_by_epoch.csv"
+    LR_TABLE = os.environ.get("LR_TABLE", DEFAULT_LR_TABLE)
+    
+    def load_lr_table_series(path: str):
+        if (path is None) or (path == ""):
+            return None
+        if not os.path.exists(path):
+            print(f"[LR] table not found: {path} (disable)")
+            return None
+
+        df = pd.read_csv(path)
+        if "epoch" not in df.columns:
+            raise ValueError(f"LR table missing 'epoch' column: {df.columns.tolist()}")
+        if "lr_mult" not in df.columns:
+            raise ValueError(f"LR table missing 'lr_mult' column: {df.columns.tolist()}")
+
+        df["epoch"] = df["epoch"].astype(int)
+        df["lr_mult"] = pd.to_numeric(df["lr_mult"], errors="coerce")
+
+        # epoch昇順 + lr_mult欠損は落とす（または後で default 扱いでもOK）
+        df = df.sort_values("epoch")
+        df = df.dropna(subset=["lr_mult"])
+    
+        s = df.set_index("epoch")["lr_mult"]
+        return s
+
+    lr_series = load_lr_table_series(LR_TABLE)
+    print(f"[LR] using lr schedule table: {LR_TABLE}" if lr_series is not None else "[LR] disabled")
+    
 
     fstat = FStatWrapper(model, device=C.device, tau=C.EMA_TAU, scale=C.FSTAT_SCALE)
 
     prev_state = None
     alpha = 0.5
 
+    def safe_lr_mult(epoch: int) -> float:
+        if lr_series is None or len(lr_series) == 0:
+            return 1.0
+
+        # forward-fill：epoch以下で最大のキーを探す
+        # （epoch=201なら200の値を使う）
+        idx = lr_series.index.values
+        # searchsortedで「挿入位置」を求め、1つ戻す
+        pos = idx.searchsorted(epoch, side="right") - 1
+        if pos < 0:
+            mult = 1.0
+        else:
+            mult = float(lr_series.iloc[pos])
+
+        if not math.isfinite(mult):
+            mult = 1.0
+
+        # 安全クリップ
+        mult = max(0.1, min(mult, 2.0))
+        return mult
+
     for epoch in range(C.EPOCHS):
-        # ★追加：epoch開始時にLRを更新
-        if lr_sched is not None:
-            mult = lr_sched.lr_mult(epoch)
-            for pg in opt.param_groups:
-                pg["lr"] = C.LR * mult
+        mult = safe_lr_mult(epoch)
+        lr_now = C.LR * mult
+        for pg in opt.param_groups:
+            pg["lr"] = lr_now
+        if epoch % C.LOG_EVERY == 0:
+            print(f"[LR] epoch={epoch} mult={mult:.4f} lr={lr_now:.6g}")
 
         model.train()
         opt.zero_grad()
