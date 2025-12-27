@@ -1,133 +1,225 @@
 # stepLR_cluster_eventrate.py
+# 固定I/O仕様:
+#   input : runs/<RUN_ID>/alpha_log.csv
+#   output: runs/<RUN_ID>/lr_mult_by_epoch.csv
+#           runs/<RUN_ID>/lr_mult_by_cluster.csv
+#
+# 実行例:
+#   RUN_ID=test1 python stepLR_cluster_eventrate.py
+#   python stepLR_cluster_eventrate.py --run_id test1
+#   python stepLR_cluster_eventrate.py --run_dir runs/test1
+#
+# 仕様（この実装を公式仕様として固定する前提）
+# 1) 必須列（alpha_log.csv）:
+#    - epoch (int)
+#    - alpha_used (float)  : そのepochでforwardに使ったalpha
+#    - alpha (float)       : そのepochのepsilon gateで更新された「次epoch向けalpha」
+#    - epsilon (float)     : モデル差分指標（符号つきでも可）
+#    ※他の列(dC等)は任意。あれば補助的に使えるが、この完成版では必須にしない。
+#
+# 2) cluster_label の定義（alpha_used による3値ビン固定）:
+#    - 0: alpha_used < 0.60
+#    - 1: 0.60 <= alpha_used < 0.90
+#    - 2: alpha_used >= 0.90
+#
+# 3) is_event の判定（epochごとの“変化イベント”）:
+#    - delta_alpha = |alpha - alpha_used|
+#    - is_event = (|epsilon| >= eps_thr) OR (delta_alpha >= alpha_thr)
+#    デフォルト: eps_thr=0.10, alpha_thr=0.05
+#    ※epoch=0などで epsilon/alpha が欠損の行は is_event=False 扱い
+#
+# 4) lr_mult の計算（clusterごとの event_rate を使う）:
+#    - cluster別に event_rate = (#is_event True) / (points)
+#    - propose_lr_mult(event_rate) で lr_mult を決定
+#      conservative: event多い=不安定 → lrを下げる
+#      aggressive  : event多い=学習必要 → lrを上げる
+#    - lr_mult は cluster毎に一定値、各epochへ付与
+#
+# 注意:
+# - lr_mult_by_epoch.csv は alpha_log に存在する epoch（通常LOG_EVERY刻み）だけ出します。
+#   train側は forward-fill で運用する想定（あなたの train.py の safe_lr_mult と整合）。
+
 import argparse
+import os
 from pathlib import Path
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-def load_threshold_csv(path: Path) -> pd.DataFrame:
-    thr = pd.read_csv(path)
-    # 必須列チェック
-    need = {"epoch", "is_event"}
-    missing = need - set(thr.columns)
-    if missing:
-        raise ValueError(f"threshold csv missing columns: {missing} in {path}")
-    thr = thr.copy()
-    thr["is_event"] = thr["is_event"].astype(bool)
-    return thr
 
-def load_aligned_windows(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    need = {"epoch_start", "epoch_end"}
-    missing = need - set(df.columns)
-    if missing:
-        raise ValueError(f"aligned windows csv missing columns: {missing} in {path}")
-
-    # cluster列名は出力の揺れがあり得るので吸収
-    cluster_col = None
-    for cand in ["cluster_aligned", "majority", "run1", "cluster"]:
-        if cand in df.columns:
-            cluster_col = cand
-            break
-    if cluster_col is None:
-        raise ValueError(
-            f"aligned windows csv has no cluster label col. "
-            f"expected one of cluster_aligned/majority/run1/cluster. cols={df.columns.tolist()}"
-        )
-
-    out = df[["epoch_start", "epoch_end", cluster_col]].rename(columns={cluster_col: "cluster_label"})
-    out["epoch_start"] = out["epoch_start"].astype(int)
-    out["epoch_end"] = out["epoch_end"].astype(int)
-    return out
-
-def map_epoch_to_cluster(thr: pd.DataFrame, windows: pd.DataFrame) -> pd.DataFrame:
-    """
-    epochがどのwindow(epoch_start..epoch_end)に属するかで cluster_label を付与
-    """
-    # windowが重ならない前提（あなたのtrajectory window作りはそのはず）
-    windows = windows.sort_values(["epoch_start", "epoch_end"]).reset_index(drop=True)
-
-    # epochごとに線形スキャンでも小さいので十分
-    labels = []
-    w = windows.to_dict("records")
-
-    for e in thr["epoch"].astype(int).tolist():
-        lab = None
-        for row in w:
-            if row["epoch_start"] <= e <= row["epoch_end"]:
-                lab = row["cluster_label"]
-                break
-        labels.append(lab)
-
-    out = thr.copy()
-    out["cluster_label"] = labels
-    return out
-
-def propose_lr_mult(event_rate: float,
-                    min_mult: float = 0.5,
-                    max_mult: float = 1.2,
-                    mode: str = "conservative") -> float:
+def propose_lr_mult(
+    event_rate: float,
+    min_mult: float = 0.5,
+    max_mult: float = 1.2,
+    mode: str = "conservative",
+) -> float:
     """
     event率→lr倍率のヒューリスティック。
     conservative: eventが多い=不安定/切替頻発 → lr下げる
-    aggressive:   eventが多い=学習が必要 → lr上げる
+    aggressive:   eventが多い=学習が必要       → lr上げる
     """
     er = float(np.clip(event_rate, 0.0, 1.0))
-
     if mode == "conservative":
-        # er=0 -> max_mult, er=1 -> min_mult (線形)
-        mult = max_mult - (max_mult - min_mult) * er
+        mult = max_mult - (max_mult - min_mult) * er  # er=0 -> max, er=1 -> min
     elif mode == "aggressive":
-        # er=0 -> min_mult, er=1 -> max_mult
-        mult = min_mult + (max_mult - min_mult) * er
+        mult = min_mult + (max_mult - min_mult) * er  # er=0 -> min, er=1 -> max
     else:
         raise ValueError("mode must be conservative or aggressive")
-
     return float(np.clip(mult, min_mult, max_mult))
+
+
+def load_alpha_log(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(f"alpha_log not found: {path}")
+
+    df = pd.read_csv(path)
+
+    # 必須列（固定仕様）
+    need = {"epoch", "alpha_used", "alpha", "epsilon"}
+    missing = need - set(df.columns)
+    if missing:
+        raise ValueError(f"alpha_log missing columns: {missing} in {path}")
+
+    out = df.copy()
+    out["epoch"] = out["epoch"].astype(int)
+
+    # 数値化（壊れている行は NaN にして後で安全処理）
+    for c in ["alpha_used", "alpha", "epsilon"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+
+    out = out.sort_values("epoch").reset_index(drop=True)
+    return out
+
+def ensure_epoch0_row(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    lr_mult_by_epoch の事故防止:
+    alpha_log に epoch=0 が無い場合は自動で補完する。
+    - alpha_used/alpha/epsilon は NaN にしておき、後段の is_event=False 扱いに落ちる
+    - lr_mult は最終的に 1.0（欠損→1.0 ルール）になる
+    """
+    if len(df) == 0:
+        # 空なら epoch=0 だけ作る
+        return pd.DataFrame([{"epoch": 0, "alpha_used": np.nan, "alpha": np.nan, "epsilon": np.nan}])
+
+    if (df["epoch"] == 0).any():
+        return df
+
+    row0 = {"epoch": 0, "alpha_used": np.nan, "alpha": np.nan, "epsilon": np.nan}
+    df2 = pd.concat([pd.DataFrame([row0]), df], ignore_index=True)
+    df2 = df2.sort_values("epoch").reset_index(drop=True)
+    return df2
+
+def assign_cluster(alpha_used: pd.Series) -> pd.Series:
+    """
+    固定仕様: alpha_used を 3ビンに分ける（0/1/2）
+      0: <0.60, 1: [0.60,0.90), 2: >=0.90
+    """
+    bins = [-np.inf, 0.60, 0.90, np.inf]
+    labels = [0, 1, 2]
+    cl = pd.cut(alpha_used, bins=bins, labels=labels, right=False, include_lowest=True)
+    # cl は Categorical なので int に直す（欠損は NaN のまま）
+    return cl.astype("float")  # いったんfloat（NaN保持）→最後にInt化
+
+
+def compute_events(df: pd.DataFrame, eps_thr: float, alpha_thr: float) -> pd.Series:
+    """
+    固定仕様: is_event = (|epsilon|>=eps_thr) OR (|alpha-alpha_used|>=alpha_thr)
+    欠損は False
+    """
+    eps = df["epsilon"].astype(float)
+    au = df["alpha_used"].astype(float)
+    a = df["alpha"].astype(float)
+
+    delta_alpha = (a - au).abs()
+    is_event = (eps.abs() >= eps_thr) | (delta_alpha >= alpha_thr)
+
+    # 欠損を False 扱い
+    is_event = is_event.fillna(False).astype(bool)
+    return is_event
+
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run_dir", type=str, required=True, help="directory containing threshold_timeseries_with_events.csv and aligned_cluster_by_window_with_agreement.csv")
-    ap.add_argument("--thr", type=str, default="threshold_timeseries_with_events.csv")
-    ap.add_argument("--aligned", type=str, default="aligned_cluster_by_window_with_agreement.csv")
-    ap.add_argument("--out_dir", type=str, default=None)
+    ap.add_argument("--run_id", type=str, default=None, help="RUN_ID (runs/<RUN_ID>)")
+    ap.add_argument("--run_dir", type=str, default=None, help="run directory path (e.g. runs/test1)")
     ap.add_argument("--mode", type=str, default="conservative", choices=["conservative", "aggressive"])
     ap.add_argument("--min_mult", type=float, default=0.5)
     ap.add_argument("--max_mult", type=float, default=1.2)
+
+    # イベント判定閾値（固定仕様のパラメータとして外出し）
+    ap.add_argument("--eps_thr", type=float, default=0.10, help="event if |epsilon| >= eps_thr")
+    ap.add_argument("--alpha_thr", type=float, default=0.05, help="event if |alpha-alpha_used| >= alpha_thr")
+    ap.add_argument("--min_points", type=int, default=3,
+                help="clusters with < min_points will be lr_mult=1.0 (guard)")
+
     args = ap.parse_args()
 
-    run_dir = Path(args.run_dir)
-    thr_path = run_dir / args.thr
-    aligned_path = run_dir / args.aligned
-    out_dir = Path(args.out_dir) if args.out_dir else run_dir
+    # run_dir 決定（固定I/O）
+    run_id = args.run_id or os.environ.get("RUN_ID")
+    if args.run_dir:
+        run_dir = Path(args.run_dir)
+    else:
+        if not run_id:
+            raise ValueError("Specify --run_dir or set RUN_ID (env) or pass --run_id")
+        run_dir = Path("runs") / run_id
 
-    thr = load_threshold_csv(thr_path)
-    windows = load_aligned_windows(aligned_path)
-    joined = map_epoch_to_cluster(thr, windows)
+    alpha_log_path = run_dir / "alpha_log.csv"
+    out_epoch_path = run_dir / "lr_mult_by_epoch.csv"
+    out_cluster_path = run_dir / "lr_mult_by_cluster.csv"
 
-    # cluster別に event率
-    g = joined.dropna(subset=["cluster_label"]).groupby("cluster_label")["is_event"]
+    df = load_alpha_log(alpha_log_path)
+    df = ensure_epoch0_row(df)
+
+    # cluster_label（固定仕様: alpha_used 3ビン）
+    df["cluster_label"] = assign_cluster(df["alpha_used"])
+
+    # is_event（固定仕様）
+    df["is_event"] = compute_events(df, eps_thr=args.eps_thr, alpha_thr=args.alpha_thr)
+
+    # cluster別 event率 → lr_mult
+    joined = df.dropna(subset=["cluster_label"]).copy()
+    joined["cluster_label"] = joined["cluster_label"].astype(int)
+
+    g = joined.groupby("cluster_label")["is_event"]
     summary = g.agg(n_points="count", n_events="sum").reset_index()
     summary["event_rate"] = summary["n_events"] / summary["n_points"]
 
     summary["lr_mult"] = summary["event_rate"].apply(
-        lambda r: propose_lr_mult(r, min_mult=args.min_mult, max_mult=args.max_mult, mode=args.mode)
+        lambda r: propose_lr_mult(
+            r,
+            min_mult=args.min_mult,
+            max_mult=args.max_mult,
+            mode=args.mode,
+        )
     )
+    # ★min_points ガード：点が少ないクラスタは lr を触らない
+    summary["guarded"] = summary["n_points"] < int(args.min_points)
+    summary.loc[summary["guarded"], "lr_mult"] = 1.0
 
-    # epoch→lr_mult のlookup表も作る（trainで使いやすい）
+    # epoch行へ付与
     lr_map = summary.set_index("cluster_label")["lr_mult"].to_dict()
-    joined["lr_mult"] = joined["cluster_label"].map(lr_map)
+    df["lr_mult"] = df["cluster_label"].map(lr_map)
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    summary.to_csv(out_dir / "lr_mult_by_cluster.csv", index=False)
-    joined[["epoch", "cluster_label", "is_event", "lr_mult"]].to_csv(out_dir / "lr_mult_by_epoch.csv", index=False)
+    # 欠損（clusterに入らない/alpha_used欠損など）は mult=1.0 に倒す（train側defaultと整合）
+    df["lr_mult"] = pd.to_numeric(df["lr_mult"], errors="coerce").fillna(1.0)
+
+    # 出力
+    run_dir.mkdir(parents=True, exist_ok=True)
+    summary.to_csv(out_cluster_path, index=False)
+
+    out = df[["epoch", "cluster_label", "is_event", "lr_mult"]].copy()
+    # cluster_label は欠損があり得るので、そのまま出す（CSVで空欄になる）
+    out["epoch"] = out["epoch"].astype(int)
+    out.to_csv(out_epoch_path, index=False)
 
     print("[saved]")
-    print(" -", out_dir / "lr_mult_by_cluster.csv")
-    print(" -", out_dir / "lr_mult_by_epoch.csv")
+    print(" -", out_cluster_path)
+    print(" -", out_epoch_path)
     print("\n[preview lr_mult_by_cluster]")
-    print(summary.sort_values("event_rate", ascending=False).to_string(index=False))
+    if len(summary) == 0:
+        print("  (no clusters found; check alpha_used column)")
+    else:
+        print(summary.sort_values("event_rate", ascending=False).to_string(index=False))
+
 
 if __name__ == "__main__":
     main()
-# 実行例
-# python stepLR_cluster_eventrate.py --run_dir runs_for_analysis/run1 --mode conservative
