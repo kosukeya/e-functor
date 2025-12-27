@@ -15,17 +15,14 @@ from losses import (
     self_attention_mass_from_attn, fstat_loss,
 )
 from metrics import semantic_health_metrics, epsilon_between_models, epsilon_to_alpha
+from lr_by_epoch import LrByEpochSchedule
 
 import csv
 from pathlib import Path
 import os
 import math
 import pandas as pd
-
-from lr_by_epoch import LrByEpochSchedule
-
-LOG_PATH = Path("runs") / "alpha_log.csv"
-LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+from datetime import datetime
 
 LOG_FIELDS = [
   "epoch","alpha","epsilon","dC","dM","d_cf","d_mono","d_att","d_self",
@@ -111,8 +108,6 @@ def branch_log_dict(model: MultiIWorldModel, data, alpha: float, device) -> dict
 # =============================
 # Experiment 3: "Island" logging
 # =============================
-ISLAND_DIR = Path("runs") / "islands"
-ISLAND_DIR.mkdir(parents=True, exist_ok=True)
 
 # でかいログを避けるため、固定サブサンプルだけ保存（必要なら増やす）
 ISLAND_MAX_SAMPLES = int(os.environ.get("ISLAND_MAX_SAMPLES", "512"))
@@ -126,7 +121,7 @@ def save_island_snapshot(
     epoch: int,
     alpha_used: float,
     device: str,
-    out_dir: Path = ISLAND_DIR,
+    out_dir: Path = "",
     max_samples: int = ISLAND_MAX_SAMPLES,
 ) -> Path:
     """
@@ -199,6 +194,29 @@ def save_island_snapshot(
 def main():
     print("device:", C.device)
 
+    # ---- RUN_ID / RUN_DIR ----
+    # 1) 環境変数 RUN_ID があればそれを使う
+    # 2) なければ時刻で自動採番（衝突しにくい）
+    RUN_ID = os.environ.get("RUN_ID", "").strip()
+    if RUN_ID == "":
+        RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    RUN_DIR = Path("runs") / RUN_ID
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+
+    print(f"[RUN] RUN_ID={RUN_ID}")
+    print(f"[RUN] RUN_DIR={RUN_DIR}")
+
+    # ---- Output paths (RUN_DIR based) ----
+    LOG_PATH = RUN_DIR / "alpha_log.csv"
+
+    ISLAND_DIR = RUN_DIR / "islands"
+    ISLAND_DIR.mkdir(parents=True, exist_ok=True)
+
+    # もし derived も train から出したいなら、ここで作っておく（任意）
+    DERIVED_DIR = RUN_DIR / "derived"
+    DERIVED_DIR.mkdir(parents=True, exist_ok=True)
+
     plant, sun, water, growth = generate_world_data(C.N)
     train_idx, val_idx = make_split(C.N, C.TRAIN_RATIO)
     train_data = pack_data(plant, sun, water, growth, train_idx, C.device)
@@ -210,7 +228,7 @@ def main():
 
     # ★追加：クラスタ条件付きLR（外部CSVでepoch→lr_multを引く）
     # 例: runs/run1/lr_mult_by_epoch.csv を手で用意しておく（解析スクリプトの出力）
-    DEFAULT_LR_TABLE = "runs/run1/lr_mult_by_epoch.csv"
+    DEFAULT_LR_TABLE = str(RUN_DIR / "lr_mult_by_epoch.csv")
     LR_TABLE = os.environ.get("LR_TABLE", DEFAULT_LR_TABLE)
     
     def load_lr_table_series(path: str):
@@ -355,6 +373,7 @@ def main():
                     epoch=epoch,
                     alpha_used=alpha_used,
                     device=C.device,
+                    out_dir=ISLAND_DIR,
                 )
                 print(f"   [ISLAND] saved snapshot: {path}")
 
@@ -457,7 +476,7 @@ def main():
             prev_state = copy.deepcopy(model.state_dict())
 
     # 便利：最後に重み保存したいなら
-    torch.save(model.state_dict(), "model_last.pt")
+    torch.save(model.state_dict(), RUN_DIR / "model_last.pt")
 
 if __name__ == "__main__":
     main()
