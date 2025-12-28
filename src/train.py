@@ -47,6 +47,45 @@ def append_row_csv(path, fieldnames, row_dict):
         safe = {k: row_dict.get(k, "") for k in fieldnames}
         w.writerow(safe)
 
+def init_alpha_log(path: Path, fieldnames, resume: bool):
+    """
+    新規run: alpha_log.csv を必ず作り直してヘッダを書く
+    resume : 触らない（追記継続）
+    """
+    if resume:
+        return
+    # 新規化：既存があっても上書き
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+
+def read_last_logged_epoch_and_alpha(log_path: Path):
+    """
+    resume時に alpha_log.csv の最終epochとalpha(=次epoch向けalpha)を読む。
+    無ければ (None, None)
+    """
+    if not log_path.exists():
+        return None, None
+    try:
+        df = pd.read_csv(log_path)
+        if len(df) == 0 or ("epoch" not in df.columns):
+            return None, None
+        df["epoch"] = pd.to_numeric(df["epoch"], errors="coerce")
+        df = df.dropna(subset=["epoch"]).sort_values("epoch")
+        last = df.iloc[-1]
+        last_epoch = int(last["epoch"])
+        last_alpha = None
+        if "alpha" in df.columns:
+            last_alpha = pd.to_numeric(last["alpha"], errors="coerce")
+            if pd.isna(last_alpha):
+                last_alpha = None
+            else:
+                last_alpha = float(last_alpha)
+        return last_epoch, last_alpha
+    except Exception:
+        return None, None
+
 # -----------------------------
 # extra logging helpers (minimal)
 # -----------------------------
@@ -194,6 +233,9 @@ def save_island_snapshot(
 def main():
     print("device:", C.device)
 
+    model = MultiIWorldModel(d_model=C.D_MODEL, n_heads=C.N_HEADS).to(C.device)
+    opt = torch.optim.Adam(model.parameters(), lr=C.LR)
+
     # ---- RUN_ID / RUN_DIR ----
     # 1) 環境変数 RUN_ID があればそれを使う
     # 2) なければ時刻で自動採番（衝突しにくい）
@@ -210,6 +252,26 @@ def main():
     # ---- Output paths (RUN_DIR based) ----
     LOG_PATH = RUN_DIR / "alpha_log.csv"
 
+    fstat = FStatWrapper(model, device=C.device, tau=C.EMA_TAU, scale=C.FSTAT_SCALE)
+    prev_state = None
+    alpha = 0.5
+
+        # ---- RESUME policy ----
+    RESUME = os.environ.get("RESUME", "0").strip() == "1"
+
+    # 新規runは必ず alpha_log を作り直す（追記事故防止）
+    init_alpha_log(LOG_PATH, LOG_FIELDS, resume=RESUME)
+
+    # resume時：alpha_log の最終epochを見て start_epoch を決める
+    start_epoch = 0
+    if RESUME:
+        last_epoch, last_alpha = read_last_logged_epoch_and_alpha(LOG_PATH)
+        if last_epoch is not None:
+            start_epoch = last_epoch + 1
+        # alpha も引き継ぎたいなら（無ければ 0.5 のまま）
+        if last_alpha is not None:
+            alpha = float(last_alpha)  # ※alpha変数をこの時点で定義する必要がある（後述）
+
     ISLAND_DIR = RUN_DIR / "islands"
     ISLAND_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -222,9 +284,7 @@ def main():
     train_data = pack_data(plant, sun, water, growth, train_idx, C.device)
     val_data   = pack_data(plant, sun, water, growth, val_idx, C.device)
 
-    model = MultiIWorldModel(d_model=C.D_MODEL, n_heads=C.N_HEADS).to(C.device)
-    
-    opt = torch.optim.Adam(model.parameters(), lr=C.LR)
+
 
     # ★追加：クラスタ条件付きLR（外部CSVでepoch→lr_multを引く）
     # 例: runs/run1/lr_mult_by_epoch.csv を手で用意しておく（解析スクリプトの出力）
@@ -247,21 +307,28 @@ def main():
         df["epoch"] = df["epoch"].astype(int)
         df["lr_mult"] = pd.to_numeric(df["lr_mult"], errors="coerce")
 
-        # epoch昇順 + lr_mult欠損は落とす（または後で default 扱いでもOK）
+        # epoch昇順
         df = df.sort_values("epoch")
+
+        # ★追加：epoch 重複は「最後の行」を採用
+        df = df.drop_duplicates(subset=["epoch"], keep="last")
+
+        # lr_mult 欠損は落とす
         df = df.dropna(subset=["lr_mult"])
-    
+
         s = df.set_index("epoch")["lr_mult"]
         return s
 
     lr_series = load_lr_table_series(LR_TABLE)
-    print(f"[LR] using lr schedule table: {LR_TABLE}" if lr_series is not None else "[LR] disabled")
-    
 
-    fstat = FStatWrapper(model, device=C.device, tau=C.EMA_TAU, scale=C.FSTAT_SCALE)
-
-    prev_state = None
-    alpha = 0.5
+    if lr_series is not None and len(lr_series) > 0:
+        print(f"[LR] using lr schedule table: {LR_TABLE}")
+        print("[LR] table preview (head):")
+        print(lr_series.head().to_string())
+        print("[LR] table preview (tail):")
+        print(lr_series.tail().to_string())
+    else:
+        print("[LR] disabled (no valid lr table)")
 
     def safe_lr_mult(epoch: int) -> float:
         if lr_series is None or len(lr_series) == 0:
@@ -284,7 +351,7 @@ def main():
         mult = max(0.1, min(mult, 2.0))
         return mult
 
-    for epoch in range(C.EPOCHS):
+    for epoch in range(start_epoch, C.EPOCHS):
         mult = safe_lr_mult(epoch)
         lr_now = C.LR * mult
         for pg in opt.param_groups:
@@ -459,7 +526,14 @@ def main():
                 }
                 for k in LOG_FIELDS:
                     row.setdefault(k, "")
-                append_row_csv(LOG_PATH, LOG_FIELDS, row)
+                if RESUME:
+                    last_epoch, _ = read_last_logged_epoch_and_alpha(LOG_PATH)
+                    if (last_epoch is not None) and (epoch <= last_epoch):
+                        print(f"[LOG] skip duplicate epoch={epoch} (last_epoch_in_log={last_epoch})")
+                    else:
+                        append_row_csv(LOG_PATH, LOG_FIELDS, row)
+                else:
+                    append_row_csv(LOG_PATH, LOG_FIELDS, row)
                 
                 print(
                     f"   dC={eps_info['dC']:.6f} "
