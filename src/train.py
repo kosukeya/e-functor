@@ -35,6 +35,7 @@ LOG_FIELDS = [
   "cf_s0_stat_mean","cf_s0_sem_mean","cf_s0_mix_mean",
   "cf_p0_stat_mean","cf_p0_sem_mean","cf_p0_mix_mean",
   "contrib_stat","contrib_sem",
+  "eps_mode","eps_override","alpha_override",
 ]
 
 def append_row_csv(path, fieldnames, row_dict):
@@ -249,12 +250,38 @@ def main():
     print(f"[RUN] RUN_ID={RUN_ID}")
     print(f"[RUN] RUN_DIR={RUN_DIR}")
 
+    # ---- epsilon/alpha intervention (minimal) ----
+    EPS_MODE = os.environ.get("EPS_MODE", "normal").strip().lower()
+    # EPS_MODE: "normal" | "freeze" | "override"
+    EPS_OVERRIDE = os.environ.get("EPS_OVERRIDE", "").strip()
+    ALPHA_OVERRIDE = os.environ.get("ALPHA_OVERRIDE", "").strip()
+
+    eps_override_val = None
+    if EPS_OVERRIDE != "":
+        try:
+            eps_override_val = float(EPS_OVERRIDE)
+        except Exception:
+            raise ValueError(f"Invalid EPS_OVERRIDE={EPS_OVERRIDE}")
+
+    alpha_override_val = None
+    if ALPHA_OVERRIDE != "":
+        try:
+            alpha_override_val = float(ALPHA_OVERRIDE)
+        except Exception:
+            raise ValueError(f"Invalid ALPHA_OVERRIDE={ALPHA_OVERRIDE}")
+
+    print(f"[EPS] mode={EPS_MODE} EPS_OVERRIDE={eps_override_val} ALPHA_OVERRIDE={alpha_override_val}")
+
     # ---- Output paths (RUN_DIR based) ----
     LOG_PATH = RUN_DIR / "alpha_log.csv"
 
     fstat = FStatWrapper(model, device=C.device, tau=C.EMA_TAU, scale=C.FSTAT_SCALE)
     prev_state = None
     alpha = 0.5
+
+    # If user forces alpha from the beginning
+    if alpha_override_val is not None:
+        alpha = float(alpha_override_val)
 
         # ---- RESUME policy ----
     RESUME = os.environ.get("RESUME", "0").strip() == "1"
@@ -491,8 +518,30 @@ def main():
                     model_f=model, model_g=prev_model, data=train_data, device=C.device,
                     w_cf=1.0, w_mono=1.0, w_att=1.0, w_self=1.0, sym_att=True,
                 )
-                epsilon_val = eps_info["epsilon"]
-                alpha_next = float(epsilon_to_alpha(epsilon_val, k=C.ALPHA_K))
+                epsilon_val = float(eps_info["epsilon"])
+
+                # ---- intervention: decide alpha_next ----
+                alpha_prev = float(alpha)  # current alpha before update
+
+                if alpha_override_val is not None:
+                    # Strongest: alpha is fixed externally
+                    alpha_next = float(alpha_override_val)
+                    mode_used = "alpha_override"
+                elif EPS_MODE == "freeze":
+                    # Freeze: do not update alpha by epsilon gate
+                    alpha_next = alpha_prev
+                    mode_used = "freeze"
+                elif EPS_MODE == "override":
+                    # Override epsilon value used for alpha update (still uses epsilon_to_alpha)
+                    if eps_override_val is None:
+                        raise ValueError("EPS_MODE=override requires EPS_OVERRIDE to be set.")
+                    alpha_next = float(epsilon_to_alpha(float(eps_override_val), k=C.ALPHA_K))
+                    mode_used = f"eps_override({eps_override_val})"
+                else:
+                    # normal behavior
+                    alpha_next = float(epsilon_to_alpha(epsilon_val, k=C.ALPHA_K))
+                    mode_used = "normal"
+
                 alpha = alpha_next
 
                 row = {
@@ -521,6 +570,9 @@ def main():
                     "I_sum_val": float(mon_val["I_sum"]),
                     "self_m_val": float(mon_val["self_m"]),
                     "corr_val": float(mon_val["corr"]),
+                    "eps_mode": mode_used,
+                    "eps_override": ("" if eps_override_val is None else float(eps_override_val)),
+                    "alpha_override": ("" if alpha_override_val is None else float(alpha_override_val)),
                     # NEW: branch logs
                     **br,
                 }
