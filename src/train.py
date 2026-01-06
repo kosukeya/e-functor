@@ -427,7 +427,7 @@ def main():
 
         # self-loop regularization
         self_mass = self_attention_mass_from_attn(attn)
-        L_self = torch.relu(self_mass - C.SELF_TARGET)
+        L_self = (self_mass - C.SELF_TARGET).abs()
 
         λ_sem_eff = max(C.LAMBDA_SEM_MIN, C.LAMBDA["sem"] * alpha)
 

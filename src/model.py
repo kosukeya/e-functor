@@ -106,6 +106,11 @@ class MultiIWorldModel(nn.Module):
         growth_stat_raw = self.head_stat(env_mean).squeeze(-1)
         growth_stat_pred = F.softplus(growth_stat_raw)
 
+        # after growth_sem_pred and growth_stat_pred
+        gate = (plant > 0).to(growth_sem_pred.dtype)  # (B,)
+        growth_sem_pred = growth_sem_pred * gate
+        growth_stat_pred = growth_stat_pred * gate
+
         if return_both:
             return growth_stat_pred, growth_sem_pred, attn, (I1, I2, I3)
         if return_attn:
