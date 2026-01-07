@@ -23,6 +23,9 @@ import os
 import math
 import pandas as pd
 from datetime import datetime
+import random
+import numpy as np
+
 
 LOG_FIELDS = [
   "epoch","alpha","epsilon","dC","dM","d_cf","d_mono","d_att","d_self",
@@ -86,6 +89,18 @@ def read_last_logged_epoch_and_alpha(log_path: Path):
         return last_epoch, last_alpha
     except Exception:
         return None, None
+
+def seed_all(seed: int):
+    import os, random
+    import numpy as np
+    random.seed(seed)
+    np.random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
 # -----------------------------
 # extra logging helpers (minimal)
@@ -233,9 +248,35 @@ def save_island_snapshot(
 
 def main():
     print("device:", C.device)
+    
+    # ---- SEED ----
+    SEED = int(os.environ.get("SEED", "0"))
+    print(f"[SEED] SEED={SEED}")
+
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+
+    # 可能な範囲で再現性を上げる（少し遅くなる場合あり）
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     model = MultiIWorldModel(d_model=C.D_MODEL, n_heads=C.N_HEADS).to(C.device)
     opt = torch.optim.Adam(model.parameters(), lr=C.LR)
+
+    # ---- quick determinism check (data) ----
+    seed_all(SEED)
+    plant1, sun1, water1, growth1 = generate_world_data(16)
+
+    seed_all(SEED)
+    plant2, sun2, water2, growth2 = generate_world_data(16)
+
+    print("[CHK] plant equal:", torch.equal(plant1, plant2))
+    print("[CHK] sun   equal:", torch.equal(sun1, sun2))
+    print("[CHK] water equal:", torch.equal(water1, water2))
+    print("[CHK] growth equal:", torch.equal(growth1, growth2))
 
     # ---- RUN_ID / RUN_DIR ----
     # 1) 環境変数 RUN_ID があればそれを使う
@@ -307,11 +348,9 @@ def main():
     DERIVED_DIR.mkdir(parents=True, exist_ok=True)
 
     plant, sun, water, growth = generate_world_data(C.N)
-    train_idx, val_idx = make_split(C.N, C.TRAIN_RATIO)
+    train_idx, val_idx = make_split(C.N, C.TRAIN_RATIO, seed=SEED)
     train_data = pack_data(plant, sun, water, growth, train_idx, C.device)
     val_data   = pack_data(plant, sun, water, growth, val_idx, C.device)
-
-
 
     # ★追加：クラスタ条件付きLR（外部CSVでepoch→lr_multを引く）
     # 例: runs/run1/lr_mult_by_epoch.csv を手で用意しておく（解析スクリプトの出力）
