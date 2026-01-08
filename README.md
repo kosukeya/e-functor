@@ -69,7 +69,7 @@ A central construct is ε (epsilon):
 This allows us to ask not whether a model changed, but how it changed.
 
 # Key Empirical Findings
-1. Structural Reproducibility Across Seeds
+## 1. Structural Reproducibility Across Seeds
 
 With α fixed and all randomness properly controlled:
 
@@ -95,7 +95,7 @@ The meaning-relevant structure is reproducible.
 
 This strongly suggests that the observed behavior is not accidental.
 
-2. Meaning Is Not Localized, But Constrained
+## 2. Meaning Is Not Localized, But Constrained
 
 Meaning does not reside in:
 
@@ -117,7 +117,7 @@ Instead, it emerges as a stable configuration under multiple simultaneous constr
 
 Remove one constraint, and meaning degrades in a specific, classifiable way.
 
-3. Collapse Has Structure
+## 3. Collapse Has Structure
 
 When meaning fails, it does not fail arbitrarily.
 
