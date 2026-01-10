@@ -1,5 +1,6 @@
 # train.py
 import copy
+import json
 import torch
 import torch.nn.functional as F
 from typing import Dict, Any
@@ -39,6 +40,10 @@ LOG_FIELDS = [
   "cf_p0_stat_mean","cf_p0_sem_mean","cf_p0_mix_mean",
   "contrib_stat","contrib_sem",
   "eps_mode","eps_override","alpha_override",
+  # ---- C knobs (loss multipliers) ----
+  "mul_real","mul_sem",
+  "mul_cf","mul_mono","mul_cos","mul_ent","mul_env","mul_self",
+  "self_target",
 ]
 
 def append_row_csv(path, fieldnames, row_dict):
@@ -313,6 +318,46 @@ def main():
 
     print(f"[EPS] mode={EPS_MODE} EPS_OVERRIDE={eps_override_val} ALPHA_OVERRIDE={alpha_override_val}")
 
+    # ---- C knobs: loss multipliers & self_target override ----
+    def _read_float_env(name: str, default: float) -> float:
+        s = os.environ.get(name, "").strip()
+        if s == "":
+            return float(default)
+        try:
+            v = float(s)
+        except Exception:
+            raise ValueError(f"Invalid {name}={s}")
+        if not math.isfinite(v):
+            raise ValueError(f"Invalid {name}={s} (non-finite)")
+        return float(v)
+
+    mul_real = _read_float_env("MUL_REAL", 1.0)
+    mul_sem  = _read_float_env("MUL_SEM",  1.0)
+    mul_cf   = _read_float_env("MUL_CF",   1.0)
+    mul_mono = _read_float_env("MUL_MONO", 1.0)
+    mul_cos  = _read_float_env("MUL_COS",  1.0)
+    mul_ent  = _read_float_env("MUL_ENT",  1.0)
+    mul_env  = _read_float_env("MUL_ENV",  1.0)
+    mul_self = _read_float_env("MUL_SELF", 1.0)
+
+    # SELF_TARGET override (optional)
+    self_target_override = os.environ.get("SELF_TARGET_OVERRIDE", "").strip()
+    if self_target_override != "":
+        try:
+            self_target_val = float(self_target_override)
+        except Exception:
+            raise ValueError(f"Invalid SELF_TARGET_OVERRIDE={self_target_override}")
+    else:
+        self_target_val = float(C.SELF_TARGET)
+
+    print(
+        "[MUL] "
+        f"real={mul_real} sem={mul_sem} cf={mul_cf} mono={mul_mono} "
+        f"cos={mul_cos} ent={mul_ent} env={mul_env} self={mul_self} "
+        f"self_target={self_target_val}"
+    )
+
+
     # ---- Output paths (RUN_DIR based) ----
     LOG_PATH = RUN_DIR / "alpha_log.csv"
 
@@ -435,6 +480,7 @@ def main():
         λ_ent_eff  = C.LAMBDA["ent_base"]  * (0.5 + 0.5 * alpha)
         λ_env_eff  = C.LAMBDA["env_base"]  * (0.5 + 0.5 * alpha)
         λ_real_eff = C.LAMBDA["real_base"] * (1.5 - 0.5 * alpha)
+        # NOTE: multipliers are applied later (near loss assembly) to keep λ_*_eff readable
 
         # real (F2 mix)
         L_real_mix, attn, I_triplet = loss_real_with_attn_F2(model, train_data, alpha)
@@ -466,19 +512,19 @@ def main():
 
         # self-loop regularization
         self_mass = self_attention_mass_from_attn(attn)
-        L_self = (self_mass - C.SELF_TARGET).abs()
+        L_self = (self_mass - self_target_val).abs()
 
         λ_sem_eff = max(C.LAMBDA_SEM_MIN, C.LAMBDA["sem"] * alpha)
 
         loss = (
-            λ_real_eff * L_real_mix
-            + λ_sem_eff * L_real_sem
-            + λ_cf_eff   * (L_cf_s + L_cf_p)
-            + λ_mono_eff * L_mono
-            + λ_cos_eff  * L_cos
-            - λ_ent_eff  * H_I
-            + λ_env_eff  * L_env
-            + C.LAMBDA["self_"] * L_self
+            (mul_real * λ_real_eff) * L_real_mix
+            + (mul_sem  * λ_sem_eff) * L_real_sem
+            + (mul_cf   * λ_cf_eff)   * (L_cf_s + L_cf_p)
+            + (mul_mono * λ_mono_eff) * L_mono
+            + (mul_cos  * λ_cos_eff)  * L_cos
+            - (mul_ent  * λ_ent_eff)  * H_I
+            + (mul_env  * λ_env_eff)  * L_env
+            + (mul_self * C.LAMBDA["self_"]) * L_self
             + C.LAMBDA["reverse"] * L_reverse
         )
 
@@ -612,6 +658,16 @@ def main():
                     "eps_mode": mode_used,
                     "eps_override": ("" if eps_override_val is None else float(eps_override_val)),
                     "alpha_override": ("" if alpha_override_val is None else float(alpha_override_val)),
+                    # ---- C knobs log ----
+                    "mul_real": float(mul_real),
+                    "mul_sem":  float(mul_sem),
+                    "mul_cf":   float(mul_cf),
+                    "mul_mono": float(mul_mono),
+                    "mul_cos":  float(mul_cos),
+                    "mul_ent":  float(mul_ent),
+                    "mul_env":  float(mul_env),
+                    "mul_self": float(mul_self),
+                    "self_target": float(self_target_val),
                     # NEW: branch logs
                     **br,
                 }
