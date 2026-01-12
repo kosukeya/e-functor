@@ -125,7 +125,22 @@ def detect_env_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_soft
 
     confirm = (z_de > 4.0) | (z_dI > 4.0) | (z_dc > 3.0)  # corr drop is weaker
 
-    trigger = (hard | soft) & confirm
+    primary = (hard | soft)
+
+    # confirm strength (1つのスコアに畳み込む)
+    z_conf = np.nanmax(
+        np.stack([z_de, z_dI, 0.7 * z_dc], axis=0),
+        axis=0
+    )
+
+    # OR-mix:
+    # 1) 従来: primary & confirm
+    # 2) 強primaryなら confirmが弱くても拾う（ログ間隔が粗いとき用）
+    # 3) 強confirmなら primaryが弱くても拾う（primaryが1点だけ外れるとき用）
+    strong_primary = (z > (z_hard + 1.0))          # 例: 5σ相当
+    strong_confirm = (z_conf > (z_hard + 1.0))     # 例: 5σ相当
+
+    trigger = (primary & confirm) | strong_primary | (strong_confirm & primary)
 
     if not np.any(trigger):
         return None
@@ -161,7 +176,7 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
     # absolute gate
     abs_gate = self_err > max(float(self_target) * 0.8, med + 4.0 * sig)
 
-    primary = hard | soft | abs_gate
+    primary = hard | soft
 
     # confirm with d_self
     dself = df["d_self"].to_numpy(dtype=float)
@@ -175,7 +190,7 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
     confirm_near[:-1] |= confirm[1:]
     confirm_near[1:]  |= confirm[:-1]
 
-    trigger = primary & confirm_near
+    trigger = (primary & confirm_near) | abs_gate
     if not np.any(trigger):
         return None
 
