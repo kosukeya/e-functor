@@ -14,7 +14,30 @@ import pandas as pd
 
 
 EPS = 1e-12
+ 
+def safe_nanmax_stack(arrs: List[np.ndarray], axis: int = 0) -> np.ndarray:
+    """
+     np.nanmax on a stacked array, but WITHOUT RuntimeWarning when all-NaN slices exist.
+    If a slice is all-NaN, result is NaN for that position.
+    """
+    X = np.stack(arrs, axis=axis)
+    # mask: True where every value along 'axis' is NaN
+    all_nan = np.all(np.isnan(X), axis=axis)
+    # avoid RuntimeWarning: replace all-NaN slices with -inf BEFORE nanmax
+    X2 = X.copy()
+    # broadcast all_nan mask to X's shape
+    if axis == 0:
+        X2[:, all_nan] = -np.inf
+    else:
+        # generic broadcast (rarely needed here)
+        idx = [slice(None)] * X2.ndim
+        idx[axis] = all_nan
+        X2[tuple(idx)] = -np.inf
+    out = np.nanmax(X2, axis=axis)
+    out[out == -np.inf] = np.nan
+    return out
 
+MIN_SIGMA = 1e-4  # ここは調整可（d_selfのスケール次第）
 
 def robust_stats(x: np.ndarray) -> Tuple[float, float]:
     """Return (median, robust_sigma) where robust_sigma ~ std using MAD."""
@@ -24,6 +47,8 @@ def robust_stats(x: np.ndarray) -> Tuple[float, float]:
     med = float(np.median(x))
     mad = float(np.median(np.abs(x - med)))
     robust_sigma = 1.4826 * (mad + EPS)
+    scale = np.nanmedian(np.abs(x))  # baselineの典型スケール
+    robust_sigma = max(robust_sigma, max(1e-4, 0.1 * scale))
     return med, robust_sigma
 
 
@@ -81,6 +106,17 @@ def require_cols(df: pd.DataFrame, cols: List[str]) -> None:
     missing = [c for c in cols if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns in CSV: {missing}")
+    
+def drop_first_baseline_row(base: pd.DataFrame, min_len: int = 4) -> pd.DataFrame:
+    """
+    For self-related signals, the very first logged row often contains warmup/init artifacts.
+    If baseline is long enough, drop the first row to avoid poisoning robust stats.
+    """
+    if base is None:
+        return base
+    if len(base) >= min_len:
+        return base.iloc[1:].copy()
+    return base
 
 
 def detect_env_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_soft: float) -> Optional[EventHit]:
@@ -128,11 +164,8 @@ def detect_env_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_soft
     primary = (hard | soft)
 
     # confirm strength (1つのスコアに畳み込む)
-    z_conf = np.nanmax(
-        np.stack([z_de, z_dI, 0.7 * z_dc], axis=0),
-        axis=0
-    )
-
+    z_conf = safe_nanmax_stack([z_de, z_dI, 0.7 * z_dc], axis=0)
+  
     # OR-mix:
     # 1) 従来: primary & confirm
     # 2) 強primaryなら confirmが弱くても拾う（ログ間隔が粗いとき用）
@@ -158,13 +191,21 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
       primary: self_err = |self_m_tr - self_target| has z > z_hard (2 consecutive) OR z > z_soft (2/3)
               OR absolute threshold self_err > max(self_target*0.8, med + 4σ)
       confirm: d_self z > 3 (nearby)
+      confirm: d_self z > 3 (nearby)
+    Patch(A):
+      - Promote d_self anomaly to PRIMARY as well (previously only confirm).
+      - Add |Δ self_m_tr| anomaly as PRIMARY (helps with sparse logging).
+      - OR-mix: allow strong primary even if confirm is weak, and vice versa (nearby).
     """
     require_cols(df, ["epoch", "self_m_tr", "d_self"])
+
+    # For self-related stats, avoid warmup/init artifact in the very first baseline row.
+    base2 = drop_first_baseline_row(base, min_len=4)
 
     self_m = df["self_m_tr"].to_numpy(dtype=float)
     self_err = np.abs(self_m - float(self_target))
 
-    self_m_b = base["self_m_tr"].to_numpy(dtype=float)
+    self_m_b = base2["self_m_tr"].to_numpy(dtype=float)
     self_err_b = np.abs(self_m_b - float(self_target))
 
     med, sig = robust_stats(self_err_b)
@@ -176,29 +217,118 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
     # absolute gate
     abs_gate = self_err > max(float(self_target) * 0.8, med + 4.0 * sig)
 
-    primary = hard | soft
-
-    # confirm with d_self
+    # --- d_self anomaly (was confirm only; now also contributes to primary) ---
     dself = df["d_self"].to_numpy(dtype=float)
-    dself_b = base["d_self"].to_numpy(dtype=float)
+    dself_b = base2["d_self"].to_numpy(dtype=float)
     med_ds, sig_ds = robust_stats(dself_b)
     z_ds = robust_z(dself, med_ds, sig_ds)
-    confirm = z_ds > 3.0
+
+    # --- |Δ self_m_tr| anomaly (sparse logs friendly) ---
+    d_selfm = np.abs(compute_diff_series(self_m))
+    d_selfm_b = np.abs(compute_diff_series(base2["self_m_tr"].to_numpy(dtype=float)))
+    med_dm, sig_dm = robust_stats(d_selfm_b)
+    z_dm = robust_z(d_selfm, med_dm, sig_dm)
+
+    # primary components
+    primary_err = hard | soft | abs_gate
+
+    # d_self primary gate: allow either z_hard-ish OR z_soft-ish (2/3) for robustness
+    primary_dself_raw = consecutive_true(z_ds > z_hard, k=2) | two_of_three(z_ds > z_soft)
+
+    # d_self を primary にするには「実体の変化」も要求する
+    has_real_self_change = (z > z_soft) | (z_dm > z_soft) | abs_gate
+    primary_dself = primary_dself_raw & has_real_self_change
+
+    # Δself_m_tr primary gate: usually more noisy, so keep a slightly stricter default
+    primary_dselfm = consecutive_true(z_dm > (z_hard - 0.5), k=2) | two_of_three(z_dm > (z_soft + 0.5))
+
+    # merge to primary
+    primary = primary_err | primary_dself | primary_dselfm
+
+    # confirm (keep d_self as confirm signal, but make it "nearby-friendly")
+    confirm = (z_ds > 3.0)
 
     # allow confirm within +/-1 log step
     confirm_near = confirm.copy()
     confirm_near[:-1] |= confirm[1:]
     confirm_near[1:]  |= confirm[:-1]
 
-    trigger = (primary & confirm_near) | abs_gate
+    # OR-mix (like env_break):
+    # - classic: primary & confirm_near
+    # - strong primary: very large z on any primary channel
+    # - strong confirm: very large z_ds, but primary may be a 1-point miss
+    # NOTE:
+    # z_ds(d_self) は baseline が小さいと爆発しやすいので、
+    # strong_primary/score の主導には使わず「補助トリガ」に回す。
+    # IMPORTANT:
+    #   Do NOT let d_self alone create strong_primary.
+    #   Only allow d_self to contribute when "real self change" gate holds.
+    z_primary_core = safe_nanmax_stack([z, z_dm], axis=0)  # self_err / Δself_m only
+    z_primary_dself = np.where(primary_dself, z_ds, np.nan)  # d_self only when gated
+    z_primary = safe_nanmax_stack([z_primary_core, z_primary_dself], axis=0)
+    strong_primary = (z_primary > (z_hard + 1.0))   # e.g., 5σ相当 (gated)
+
+    # d_self が強烈でも「実体変化があるときだけ」強confirm扱い
+    strong_confirm = (z_ds > (z_hard + 1.0)) & has_real_self_change
+
+    trigger = (primary & confirm_near) | strong_primary | (strong_confirm & primary)
     if not np.any(trigger):
         return None
 
     i = int(np.argmax(trigger))
     epoch = int(df.loc[i, "epoch"])
-    reason = f"self_err={self_err[i]:.4f} (target={self_target}), z(self_err)={z[i]:.2f}, z(d_self)={z_ds[i]:.2f}"
-    score = float(max(z[i], z_ds[i]))
+    reason = (
+        f"self_err={self_err[i]:.4f} (target={self_target}), "
+        f"z(self_err)={z[i]:.2f}, z(d_self)={z_ds[i]:.2f}, z(|Δself_m|)={z_dm[i]:.2f}"
+    )
+    # score should reflect self target violation / state change.
+    # include z_ds only when primary_dself gate is active at i.
+    cand = [z[i], z_dm[i]]
+    if bool(primary_dself[i]):
+        cand.append(z_ds[i])
+    score = float(np.nanmax(cand))
     return EventHit(epoch=epoch, kind="self_break", score=score, reason=reason)
+
+def detect_self_shock(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_soft: float) -> Optional[EventHit]:
+    """
+    Self-shock (NOT a self_target violation):
+      Detect an abrupt spike in d_self itself (e.g., teacher/student mismatch or stability issue),
+      but do NOT let it become FIRST BREAK. This is a diagnostic event.
+
+    Trigger:
+      - z(d_self) > z_hard (2 consecutive) OR z(d_self) > z_soft (2/3)
+      - and NOT accompanied by strong self_err drift (otherwise self_break covers it)
+    """
+    require_cols(df, ["epoch", "self_m_tr", "d_self"])
+    base2 = drop_first_baseline_row(base, min_len=4)
+
+    dself = df["d_self"].to_numpy(dtype=float)
+    dself_b = base2["d_self"].to_numpy(dtype=float)
+    med_ds, sig_ds = robust_stats(dself_b)
+    z_ds = robust_z(dself, med_ds, sig_ds)
+
+    # main shock condition
+    hard = consecutive_true(z_ds > z_hard, k=2)
+    soft = two_of_three(z_ds > z_soft)
+    primary = hard | soft
+
+    # exclude if there's clear drift in self_m_tr away from baseline target-ish (i.e., let self_break handle)
+    self_m = df["self_m_tr"].to_numpy(dtype=float)
+    targetish = float(np.median(base2["self_m_tr"].to_numpy(dtype=float)))
+    self_err = np.abs(self_m - targetish)
+    self_err_b = np.abs(base2["self_m_tr"].to_numpy(dtype=float) - targetish)
+    med_e, sig_e = robust_stats(self_err_b)
+    z_e = robust_z(self_err, med_e, sig_e)
+
+    not_drift = (z_e < (z_soft + 0.5)) | ~np.isfinite(z_e)
+    trigger = primary & not_drift
+    if not np.any(trigger):
+        return None
+
+    i = int(np.argmax(trigger))
+    epoch = int(df.loc[i, "epoch"])
+    reason = f"z(d_self)={z_ds[i]:.2f} (shock), z(self_err_vs_targetish)={z_e[i]:.2f}"
+    return EventHit(epoch=epoch, kind="self_shock", score=float(z_ds[i]), reason=reason)
 
 
 def detect_rule_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_soft: float) -> Optional[EventHit]:
@@ -254,6 +384,7 @@ def pick_first_event(events: List[EventHit]) -> Optional[EventHit]:
     if not events:
         return None
     # earliest epoch wins; tie-break: self > env > rule; then higher score
+    # NOTE: self_shock is diagnostic and should NOT win FIRST BREAK unless nothing else exists.
     prio = {"self_break": 0, "env_break": 1, "rule_break": 2}
     events_sorted = sorted(
         events,
@@ -350,6 +481,11 @@ def main():
     if self_hit:
         events.append(self_hit)
 
+    # diagnostic only (should not become FIRST BREAK)
+    shock_hit = detect_self_shock(df, base, z_hard=z_hard, z_soft=z_soft)
+    if shock_hit:
+        events.append(shock_hit)
+
     rule_hit = detect_rule_break(df, base, z_hard=z_hard, z_soft=z_soft)
     if rule_hit:
         events.append(rule_hit)
@@ -369,7 +505,11 @@ def main():
         print(f"- {e.kind}: epoch={e.epoch}, score={e.score:.2f}")
         print(f"  reason: {e.reason}")
 
-    first = pick_first_event(events)
+    # FIRST BREAK: ignore self_shock unless it is the only event kind present
+    events_for_first = [e for e in events if e.kind != "self_shock"]
+    if not events_for_first:
+        events_for_first = events
+    first = pick_first_event(events_for_first)
     print()
     print("---- FIRST BREAK (critical epoch) ----")
     print(f"kind={first.kind}  epoch={first.epoch}  score={first.score:.2f}")
