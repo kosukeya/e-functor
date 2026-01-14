@@ -80,6 +80,12 @@ def two_of_three(mask: np.ndarray) -> np.ndarray:
         out[i] = (window.sum() >= 2)
     return out
 
+def first_true_epoch(mask: np.ndarray, epochs: np.ndarray) -> Optional[int]:
+    """Return epoch at first True in mask, else None."""
+    idx = np.where(mask)[0]
+    if idx.size == 0:
+        return None
+    return int(epochs[int(idx[0])])
 
 @dataclass
 class EventHit:
@@ -101,6 +107,91 @@ def compute_diff_series(x: np.ndarray) -> np.ndarray:
     d[1:] = x[1:] - x[:-1]
     return d
 
+def argmax_finite(x: np.ndarray) -> Optional[int]:
+    """Return argmax of finite values, or None if no finite values exist."""
+    m = np.isfinite(x)
+    if not np.any(m):
+        return None
+    # use -inf for non-finite so argmax works
+    y = np.where(m, x, -np.inf)
+    i = int(np.argmax(y))
+    if not np.isfinite(y[i]):
+        return None
+    return i
+
+def fmt_stat(name: str, med: float, sig: float) -> str:
+    return f"{name}: med={med:.6g}, sigma={sig:.6g}"
+
+def diagnose_self(df: pd.DataFrame, base_self: pd.DataFrame, self_target: float,
+                  z_hard: float, z_soft: float) -> None:
+    """
+    Print why self_break/self_shock may be absent:
+      - baseline med/sigma for self_err, d_self, |Δself_m|
+      - max z and its epoch for each channel
+      - whether key gates ever become true
+    """
+    if ("self_m_tr" not in df.columns) or ("d_self" not in df.columns):
+        print("[DIAG][self] skipped: missing self_m_tr or d_self columns")
+        return
+    if len(base_self) < 3:
+        print(f"[DIAG][self] skipped: base_self too small (n={len(base_self)})")
+        return
+
+    self_m = df["self_m_tr"].to_numpy(dtype=float)
+    dself  = df["d_self"].to_numpy(dtype=float)
+    epochs = df["epoch"].to_numpy(dtype=int)
+
+    # self_err
+    self_err = np.abs(self_m - float(self_target))
+    self_m_b = base_self["self_m_tr"].to_numpy(dtype=float)
+    self_err_b = np.abs(self_m_b - float(self_target))
+    med_e, sig_e = robust_stats(self_err_b)
+    z_e = robust_z(self_err, med_e, sig_e)
+
+    # d_self
+    dself_b = base_self["d_self"].to_numpy(dtype=float)
+    med_ds, sig_ds = robust_stats(dself_b)
+    z_ds = robust_z(dself, med_ds, sig_ds)
+
+    # |Δself_m|
+    d_selfm = np.abs(compute_diff_series(self_m))
+    d_selfm_b = np.abs(compute_diff_series(self_m_b))
+    med_dm, sig_dm = robust_stats(d_selfm_b)
+    z_dm = robust_z(d_selfm, med_dm, sig_dm)
+
+    # maxima
+    ie = argmax_finite(z_e)
+    ids = argmax_finite(z_ds)
+    idm = argmax_finite(z_dm)
+
+    print("[DIAG][self] baseline(after drop_first): n=", len(base_self))
+    print("[DIAG][self] " + fmt_stat("self_err", med_e, sig_e))
+    print("[DIAG][self] " + fmt_stat("d_self",   med_ds, sig_ds))
+    print("[DIAG][self] " + fmt_stat("|Δself_m|", med_dm, sig_dm))
+
+    if ie is not None:
+        print(f"[DIAG][self] max z(self_err)={z_e[ie]:.2f} at epoch={epochs[ie]} (self_err={self_err[ie]:.6g})")
+    else:
+        print("[DIAG][self] max z(self_err)=NaN (no finite)")
+    if ids is not None:
+        print(f"[DIAG][self] max z(d_self)={z_ds[ids]:.2f} at epoch={epochs[ids]} (d_self={dself[ids]:.6g})")
+    else:
+        print("[DIAG][self] max z(d_self)=NaN (no finite)")
+    if idm is not None:
+        print(f"[DIAG][self] max z(|Δself_m|)={z_dm[idm]:.2f} at epoch={epochs[idm]} (|Δself_m|={d_selfm[idm]:.6g})")
+    else:
+        print("[DIAG][self] max z(|Δself_m|)=NaN (no finite)")
+
+    # Gate coverage: did we ever exceed soft/hard?
+    any_soft_err = bool(np.any(z_e > z_soft))
+    any_hard_err = bool(np.any(z_e > z_hard))
+    any_soft_dm  = bool(np.any(z_dm > z_soft))
+    any_hard_dm  = bool(np.any(z_dm > z_hard))
+    any_soft_ds  = bool(np.any(z_ds > z_soft))
+    any_hard_ds  = bool(np.any(z_ds > z_hard))
+
+    print(f"[DIAG][self] exceed soft: self_err={any_soft_err}, |Δself_m|={any_soft_dm}, d_self={any_soft_ds}")
+    print(f"[DIAG][self] exceed hard: self_err={any_hard_err}, |Δself_m|={any_hard_dm}, d_self={any_hard_ds}")
 
 def require_cols(df: pd.DataFrame, cols: List[str]) -> None:
     missing = [c for c in cols if c not in df.columns]
@@ -199,6 +290,13 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
     """
     require_cols(df, ["epoch", "self_m_tr", "d_self"])
 
+    epochs = df["epoch"].to_numpy(dtype=int)
+    # ignore the very first log point (warmup artifact-prone)
+    valid = np.ones(len(df), dtype=bool)
+    valid[0] = False
+    # もしさらに保守的にするなら↓も可（baseline上限まで無視）
+    # valid &= (epochs > 600)
+
     # For self-related stats, avoid warmup/init artifact in the very first baseline row.
     base2 = drop_first_baseline_row(base, min_len=4)
 
@@ -211,11 +309,57 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
     med, sig = robust_stats(self_err_b)
     z = robust_z(self_err, med, sig)
 
+    # ===== DIAG: persistence / duration of exceedance for self_err =====
+    epochs = df["epoch"].to_numpy(dtype=int)
+
+    # pointwise exceed
+    ex_soft = (z > z_soft)
+    ex_hard = (z > z_hard)
+
+    # persistence patterns used by the detector
+    ex_soft_2of3 = two_of_three(ex_soft)                 # 2 of 3 window
+    ex_hard_2consec = consecutive_true(ex_hard, k=2)     # 2 consecutive
+
+    # simple counts
+    n_soft = int(np.nansum(ex_soft))
+    n_hard = int(np.nansum(ex_hard))
+    n_soft_2of3 = int(np.nansum(ex_soft_2of3))
+    n_hard_2consec = int(np.nansum(ex_hard_2consec))
+
+    # first epochs where they become true
+    first_soft = first_true_epoch(ex_soft, epochs)
+    first_hard = first_true_epoch(ex_hard, epochs)
+    first_soft_2of3 = first_true_epoch(ex_soft_2of3, epochs)
+    first_hard_2consec = first_true_epoch(ex_hard_2consec, epochs)
+
+    # longest consecutive run length (optional but useful)
+    def longest_run(mask: np.ndarray) -> int:
+        best = 0
+        run = 0
+        for v in mask:
+            run = run + 1 if bool(v) else 0
+            if run > best:
+                best = run
+        return int(best)
+
+    longest_soft_run = longest_run(ex_soft)
+    longest_hard_run = longest_run(ex_hard)
+
+    print(f"[DIAG][self] self_err exceed counts: soft(z>{z_soft})={n_soft}, hard(z>{z_hard})={n_hard}")
+    print(f"[DIAG][self] self_err persistence: 2of3_soft={n_soft_2of3}, 2consec_hard={n_hard_2consec}")
+    print(f"[DIAG][self] self_err first exceed epoch: soft={first_soft}, hard={first_hard}")
+    print(f"[DIAG][self] self_err first persistence epoch: 2of3_soft={first_soft_2of3}, 2consec_hard={first_hard_2consec}")
+    print(f"[DIAG][self] self_err longest consecutive run: soft={longest_soft_run}, hard={longest_hard_run}")
+
+
     hard = consecutive_true(z > z_hard, k=2)
     soft = two_of_three(z > z_soft)
 
     # absolute gate
-    abs_gate = self_err > max(float(self_target) * 0.8, med + 4.0 * sig)
+    abs_thr = max(float(self_target) * 0.8, med + 4.0 * sig)
+    abs_gate_raw = (self_err > abs_thr)
+    # 単発ではなく「2連続」か「2/3」だけ許可
+    abs_gate = consecutive_true(abs_gate_raw, k=2) | two_of_three(abs_gate_raw)
 
     # --- d_self anomaly (was confirm only; now also contributes to primary) ---
     dself = df["d_self"].to_numpy(dtype=float)
@@ -271,7 +415,7 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
     # d_self が強烈でも「実体変化があるときだけ」強confirm扱い
     strong_confirm = (z_ds > (z_hard + 1.0)) & has_real_self_change
 
-    trigger = (primary & confirm_near) | strong_primary | (strong_confirm & primary)
+    trigger = ((primary & confirm_near) | strong_primary | (strong_confirm & primary)) & valid
     if not np.any(trigger):
         return None
 
@@ -385,7 +529,7 @@ def pick_first_event(events: List[EventHit]) -> Optional[EventHit]:
         return None
     # earliest epoch wins; tie-break: self > env > rule; then higher score
     # NOTE: self_shock is diagnostic and should NOT win FIRST BREAK unless nothing else exists.
-    prio = {"self_break": 0, "env_break": 1, "rule_break": 2}
+    prio = {"self_break": 0, "env_break": 1, "rule_break": 2, "self_shock": 99}
     events_sorted = sorted(
         events,
         key=lambda e: (e.epoch, prio.get(e.kind, 9), -e.score),
@@ -453,6 +597,9 @@ def main():
 
     if len(base) < 3:
         raise ValueError(f"alpha_log too small for baseline: need >=3 rows, got {len(base)}.")
+    
+    # Self-related baseline: drop the first row (warmup/init artifact) if possible
+    base_self = drop_first_baseline_row(base, min_len=4)
 
 
     # infer self_target if not provided:
@@ -461,7 +608,7 @@ def main():
     if args.self_target is None:
         if "self_m_tr" in df.columns:
             # use baseline, but if baseline is first-K rows, consider using a slightly later slice
-            inferred = float(np.median(base["self_m_tr"].to_numpy(dtype=float)))
+            inferred = float(np.median(base_self["self_m_tr"].to_numpy(dtype=float)))
             self_target = inferred
         else:
             self_target = 0.03
@@ -477,14 +624,14 @@ def main():
     if env_hit:
         events.append(env_hit)
 
-    self_hit = detect_self_break(df, base, z_hard=z_hard, z_soft=z_soft, self_target=self_target)
-    if self_hit:
-        events.append(self_hit)
-
     # diagnostic only (should not become FIRST BREAK)
-    shock_hit = detect_self_shock(df, base, z_hard=z_hard, z_soft=z_soft)
+    shock_hit = detect_self_shock(df, base_self, z_hard=z_hard, z_soft=z_soft)
     if shock_hit:
         events.append(shock_hit)
+
+    self_hit = detect_self_break(df, base_self, z_hard=z_hard, z_soft=z_soft, self_target=self_target)
+    if self_hit:
+        events.append(self_hit)
 
     rule_hit = detect_rule_break(df, base, z_hard=z_hard, z_soft=z_soft)
     if rule_hit:
@@ -496,6 +643,14 @@ def main():
     print(f"z_hard={z_hard} (2 consecutive), z_soft={z_soft} (2 of 3)")
     print(f"self_target used: {self_target:.6f} (inferred={args.self_target is None})")
     print()
+
+    # Diagnostic: if neither self_break nor self_shock is detected, print why.
+    has_self_event = any(e.kind in ("self_break", "self_shock") for e in events)
+    if not has_self_event and ("self_m_tr" in df.columns) and ("d_self" in df.columns):
+        diagnose_self(df, base_self, self_target=self_target, z_hard=z_hard, z_soft=z_soft)
+        print()
+
+
 
     if not events:
         print("No break detected under current thresholds.")
