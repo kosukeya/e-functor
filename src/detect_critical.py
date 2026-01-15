@@ -6,6 +6,8 @@
 
 import argparse
 import math
+import json
+import os
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, List
 
@@ -228,6 +230,8 @@ def detect_env_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_soft
     hard = consecutive_true(z > z_hard, k=2)
     soft = two_of_three(z > z_soft)
 
+
+
     # confirmations based on diffs
     env = df["env_sum_tr"].to_numpy(dtype=float)
     Is  = df["I_sum_tr"].to_numpy(dtype=float)
@@ -275,8 +279,14 @@ def detect_env_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_soft
     return EventHit(epoch=epoch, kind="env_break", score=float(z[i]), reason=reason)
 
 
+def _first_true_epoch(df: pd.DataFrame, mask: np.ndarray) -> Optional[int]:
+    if mask is None or mask.size == 0 or not np.any(mask):
+        return None
+    i = int(np.argmax(mask))
+    return int(df.loc[i, "epoch"])
+
 def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_soft: float,
-                      self_target: float) -> Optional[EventHit]:
+                      self_target: float) -> Tuple[Optional[EventHit], Dict]:
     """
     Self-break:
       primary: self_err = |self_m_tr - self_target| has z > z_hard (2 consecutive) OR z > z_soft (2/3)
@@ -291,14 +301,25 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
     require_cols(df, ["epoch", "self_m_tr", "d_self"])
 
     epochs = df["epoch"].to_numpy(dtype=int)
-    # ignore the very first log point (warmup artifact-prone)
-    valid = np.ones(len(df), dtype=bool)
-    valid[0] = False
-    # もしさらに保守的にするなら↓も可（baseline上限まで無視）
-    # valid &= (epochs > 600)
+
+    diag: Dict = {}
 
     # For self-related stats, avoid warmup/init artifact in the very first baseline row.
+    # (重要) base2 を先に作ってから valid を計算する
     base2 = drop_first_baseline_row(base, min_len=4)
+    diag["baseline_after_drop_n"] = int(len(base2)) if base2 is not None else 0
+
+    # --- valid mask: evaluate self-events only AFTER baseline region ---
+    baseline_end_epoch = None
+    if base2 is not None and ("epoch" in base2.columns) and len(base2) > 0:
+        baseline_end_epoch = int(np.nanmax(base2["epoch"].to_numpy(dtype=float)))
+
+    valid = np.ones(len(df), dtype=bool)
+    valid[0] = False  # Always drop the very first row (warmup artifact-prone)
+
+    if baseline_end_epoch is not None and np.isfinite(baseline_end_epoch):
+        valid &= (epochs > baseline_end_epoch)
+
 
     self_m = df["self_m_tr"].to_numpy(dtype=float)
     self_err = np.abs(self_m - float(self_target))
@@ -308,6 +329,9 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
 
     med, sig = robust_stats(self_err_b)
     z = robust_z(self_err, med, sig)
+
+    diag["self_err_med"] = float(med) if np.isfinite(med) else None
+    diag["self_err_sigma"] = float(sig) if np.isfinite(sig) else None
 
     # ===== DIAG: persistence / duration of exceedance for self_err =====
     epochs = df["epoch"].to_numpy(dtype=int)
@@ -355,6 +379,34 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
     hard = consecutive_true(z > z_hard, k=2)
     soft = two_of_three(z > z_soft)
 
+    # --- diagnostics for persistence (self_err) ---
+    z_soft_mask = (z > z_soft)
+    z_hard_mask = (z > z_hard)
+    soft_2of3 = two_of_three(z_soft_mask)
+    hard_2con = consecutive_true(z_hard_mask, k=2)
+
+    def _longest_run(mask: np.ndarray) -> int:
+        if mask.size == 0:
+            return 0
+        best = 0
+        cur = 0
+        for v in mask:
+            cur = (cur + 1) if bool(v) else 0
+            if cur > best:
+                best = cur
+        return int(best)
+
+    diag["self_err_exceed_soft_count"] = int(np.nansum(z_soft_mask)) if z_soft_mask.size else 0
+    diag["self_err_exceed_hard_count"] = int(np.nansum(z_hard_mask)) if z_hard_mask.size else 0
+    diag["self_err_persist_2of3_soft_count"] = int(np.nansum(soft_2of3)) if soft_2of3.size else 0
+    diag["self_err_persist_2consec_hard_count"] = int(np.nansum(hard_2con)) if hard_2con.size else 0
+    diag["self_err_first_exceed_soft_epoch"] = _first_true_epoch(df, z_soft_mask)
+    diag["self_err_first_exceed_hard_epoch"] = _first_true_epoch(df, z_hard_mask)
+    diag["self_err_first_persist_2of3_soft_epoch"] = _first_true_epoch(df, soft_2of3)
+    diag["self_err_first_persist_2consec_hard_epoch"] = _first_true_epoch(df, hard_2con)
+    diag["self_err_longest_run_soft"] = _longest_run(z_soft_mask)
+    diag["self_err_longest_run_hard"] = _longest_run(z_hard_mask)
+
     # absolute gate
     abs_thr = max(float(self_target) * 0.8, med + 4.0 * sig)
     abs_gate_raw = (self_err > abs_thr)
@@ -367,11 +419,17 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
     med_ds, sig_ds = robust_stats(dself_b)
     z_ds = robust_z(dself, med_ds, sig_ds)
 
+    diag["d_self_med"] = float(med_ds) if np.isfinite(med_ds) else None
+    diag["d_self_sigma"] = float(sig_ds) if np.isfinite(sig_ds) else None
+
     # --- |Δ self_m_tr| anomaly (sparse logs friendly) ---
     d_selfm = np.abs(compute_diff_series(self_m))
     d_selfm_b = np.abs(compute_diff_series(base2["self_m_tr"].to_numpy(dtype=float)))
     med_dm, sig_dm = robust_stats(d_selfm_b)
     z_dm = robust_z(d_selfm, med_dm, sig_dm)
+
+    diag["d_selfm_med"] = float(med_dm) if np.isfinite(med_dm) else None
+    diag["d_selfm_sigma"] = float(sig_dm) if np.isfinite(sig_dm) else None
 
     # primary components
     primary_err = hard | soft | abs_gate
@@ -410,14 +468,27 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
     z_primary_core = safe_nanmax_stack([z, z_dm], axis=0)  # self_err / Δself_m only
     z_primary_dself = np.where(primary_dself, z_ds, np.nan)  # d_self only when gated
     z_primary = safe_nanmax_stack([z_primary_core, z_primary_dself], axis=0)
-    strong_primary = (z_primary > (z_hard + 1.0))   # e.g., 5σ相当 (gated)
+    strong_primary = (z_primary > max(5.0, (z_hard + 1.0)))
 
     # d_self が強烈でも「実体変化があるときだけ」強confirm扱い
     strong_confirm = (z_ds > (z_hard + 1.0)) & has_real_self_change
 
     trigger = ((primary & confirm_near) | strong_primary | (strong_confirm & primary)) & valid
     if not np.any(trigger):
-        return None
+        # add a few max stats to diag even when no hit
+        if z.size:
+            im = int(np.nanargmax(z)) if np.any(np.isfinite(z)) else 0
+            diag["self_err_max_z"] = float(z[im]) if np.isfinite(z[im]) else None
+            diag["self_err_max_z_epoch"] = int(df.loc[im, "epoch"])
+        if z_dm.size:
+            im = int(np.nanargmax(z_dm)) if np.any(np.isfinite(z_dm)) else 0
+            diag["d_selfm_max_z"] = float(z_dm[im]) if np.isfinite(z_dm[im]) else None
+            diag["d_selfm_max_z_epoch"] = int(df.loc[im, "epoch"])
+        if z_ds.size:
+            im = int(np.nanargmax(z_ds)) if np.any(np.isfinite(z_ds)) else 0
+            diag["d_self_max_z"] = float(z_ds[im]) if np.isfinite(z_ds[im]) else None
+            diag["d_self_max_z_epoch"] = int(df.loc[im, "epoch"])
+        return None, diag
 
     i = int(np.argmax(trigger))
     epoch = int(df.loc[i, "epoch"])
@@ -431,7 +502,12 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
     if bool(primary_dself[i]):
         cand.append(z_ds[i])
     score = float(np.nanmax(cand))
-    return EventHit(epoch=epoch, kind="self_break", score=score, reason=reason)
+
+    # also store hit-related diag
+    diag["self_break_epoch"] = int(epoch)
+    diag["self_break_score"] = float(score)
+
+    return EventHit(epoch=epoch, kind="self_break", score=score, reason=reason), diag
 
 def detect_self_shock(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_soft: float) -> Optional[EventHit]:
     """
@@ -494,6 +570,7 @@ def detect_rule_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
 
     hard = consecutive_true(z > z_hard, k=2)
     soft = two_of_three(z > z_soft)
+
     primary = hard | soft
 
     # confirmations
@@ -548,6 +625,8 @@ def main():
     ap.add_argument("--self_target", type=float, default=None,
                     help="If omitted, try to infer from early stable self_m_tr (fallback).")
     ap.add_argument("--print_head", action="store_true")
+    ap.add_argument("--json_out", type=str, default=None,
+                    help="If set, write result JSON to this path.")
     args = ap.parse_args()
 
     df = pd.read_csv(args.csv_path)
@@ -624,14 +703,17 @@ def main():
     if env_hit:
         events.append(env_hit)
 
+    diag_self: Dict = {}
+    self_hit, diag_self = detect_self_break(
+        df, base_self, z_hard=z_hard, z_soft=z_soft, self_target=self_target
+    )
+    if self_hit is not None:
+        events.append(self_hit)
+
     # diagnostic only (should not become FIRST BREAK)
     shock_hit = detect_self_shock(df, base_self, z_hard=z_hard, z_soft=z_soft)
     if shock_hit:
         events.append(shock_hit)
-
-    self_hit = detect_self_break(df, base_self, z_hard=z_hard, z_soft=z_soft, self_target=self_target)
-    if self_hit:
-        events.append(self_hit)
 
     rule_hit = detect_rule_break(df, base, z_hard=z_hard, z_soft=z_soft)
     if rule_hit:
@@ -670,6 +752,36 @@ def main():
     print(f"kind={first.kind}  epoch={first.epoch}  score={first.score:.2f}")
     print(f"reason: {first.reason}")
 
+    # ---- JSON output (optional) ----
+    if args.json_out:
+        out_dir = os.path.dirname(os.path.abspath(args.json_out))
+        if out_dir and not os.path.exists(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
+
+        payload = {
+            "csv_path": os.path.abspath(args.csv_path),
+           "baseline": {
+                "desc": baseline_desc,
+                "n": int(len(base)),
+                "baseline_args": [int(b0), int(b1)],
+                "baseline_rows": int(K),
+            },
+            "thresholds": {"z_hard": float(z_hard), "z_soft": float(z_soft)},
+            "self_target": {"value": float(self_target), "inferred": bool(args.self_target is None)},
+            "events": [
+                {"kind": e.kind, "epoch": int(e.epoch), "score": float(e.score), "reason": str(e.reason)}
+                for e in sorted(events, key=lambda x: x.epoch)
+            ],
+            "first": {
+                "kind": first.kind,
+                "epoch": int(first.epoch),
+                "score": float(first.score),
+                "reason": str(first.reason),
+            } if first else None,
+             "diag": {"self": diag_self},
+        }
+        with open(args.json_out, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
 
 if __name__ == "__main__":
     main()
