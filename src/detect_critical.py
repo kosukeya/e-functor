@@ -298,15 +298,21 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
       - Add |Δ self_m_tr| anomaly as PRIMARY (helps with sparse logging).
       - OR-mix: allow strong primary even if confirm is weak, and vice versa (nearby).
     """
+    print(f"[DIAG][self] base len(before drop)={len(base) if base is not None else None}")
+
+    SINGLE_HARD_MARGIN = 1.5   # ←ここが今回の肝。まず 1.5 推奨
+
     require_cols(df, ["epoch", "self_m_tr", "d_self"])
 
     epochs = df["epoch"].to_numpy(dtype=int)
 
     diag: Dict = {}
 
-    # For self-related stats, avoid warmup/init artifact in the very first baseline row.
-    # (重要) base2 を先に作ってから valid を計算する
-    base2 = drop_first_baseline_row(base, min_len=4)
+    # IMPORTANT:
+    # `base` passed into detect_self_break() is already "self baseline"
+    # (i.e., main() has applied drop_first_baseline_row once).
+    # Do NOT drop again here, otherwise baseline shrinks 5->4->3.
+    base2 = base
     diag["baseline_after_drop_n"] = int(len(base2)) if base2 is not None else 0
 
     # --- valid mask: evaluate self-events only AFTER baseline region ---
@@ -337,8 +343,10 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
     epochs = df["epoch"].to_numpy(dtype=int)
 
     # pointwise exceed
-    ex_soft = (z > z_soft)
-    ex_hard = (z > z_hard)
+    # NOTE: diagnostics should reflect the same evaluation region as detection.
+    # i.e., count exceedance only within `valid`.
+    ex_soft = (z > z_soft) & valid
+    ex_hard = (z > z_hard) & valid
 
     # persistence patterns used by the detector
     ex_soft_2of3 = two_of_three(ex_soft)                 # 2 of 3 window
@@ -382,6 +390,8 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
     # --- diagnostics for persistence (self_err) ---
     z_soft_mask = (z > z_soft)
     z_hard_mask = (z > z_hard)
+    z_soft_mask = (z > z_soft) & valid
+    z_hard_mask = (z > z_hard) & valid
     soft_2of3 = two_of_three(z_soft_mask)
     hard_2con = consecutive_true(z_hard_mask, k=2)
 
@@ -431,8 +441,13 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
     diag["d_selfm_med"] = float(med_dm) if np.isfinite(med_dm) else None
     diag["d_selfm_sigma"] = float(sig_dm) if np.isfinite(sig_dm) else None
 
+    single_hard = (z > z_hard) & valid
+    # Diagnostics: single hard exceed should also respect `valid`
+    single_hard = (z > z_hard) & valid
+    single_hard_strong = (z > (z_hard + SINGLE_HARD_MARGIN)) & valid
+
     # primary components
-    primary_err = hard | soft | abs_gate
+    primary_err = hard | soft | abs_gate | single_hard_strong
 
     # d_self primary gate: allow either z_hard-ish OR z_soft-ish (2/3) for robustness
     primary_dself_raw = consecutive_true(z_ds > z_hard, k=2) | two_of_three(z_ds > z_soft)
@@ -468,12 +483,16 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
     z_primary_core = safe_nanmax_stack([z, z_dm], axis=0)  # self_err / Δself_m only
     z_primary_dself = np.where(primary_dself, z_ds, np.nan)  # d_self only when gated
     z_primary = safe_nanmax_stack([z_primary_core, z_primary_dself], axis=0)
-    strong_primary = (z_primary > max(5.0, (z_hard + 1.0)))
+    strong_primary_raw = (z_primary > max(5.0, (z_hard + 1.0)))
+    strong_primary = strong_primary_raw & valid
 
     # d_self が強烈でも「実体変化があるときだけ」強confirm扱い
-    strong_confirm = (z_ds > (z_hard + 1.0)) & has_real_self_change
+    strong_confirm_raw = (z_ds > (z_hard + 1.0)) & has_real_self_change
+    strong_confirm = strong_confirm_raw & valid
 
-    trigger = ((primary & confirm_near) | strong_primary | (strong_confirm & primary)) & valid
+    # NOTE: trigger itself remains valid-gated, but we also keep raw masks for diagnostics.
+    trigger = ((primary & confirm_near) | strong_primary_raw | (strong_confirm_raw & primary)) & valid
+
     if not np.any(trigger):
         # add a few max stats to diag even when no hit
         if z.size:
@@ -488,6 +507,27 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
             im = int(np.nanargmax(z_ds)) if np.any(np.isfinite(z_ds)) else 0
             diag["d_self_max_z"] = float(z_ds[im]) if np.isfinite(z_ds[im]) else None
             diag["d_self_max_z_epoch"] = int(df.loc[im, "epoch"])
+        # ---- extra diag: strong_primary/confirm (valid-aware) ----
+        diag["strong_primary_raw_count"] = int(np.nansum(strong_primary_raw)) if strong_primary_raw.size else 0
+        diag["strong_primary_valid_count"] = int(np.nansum(strong_primary)) if strong_primary.size else 0
+        diag["strong_confirm_raw_count"] = int(np.nansum(strong_confirm_raw)) if strong_confirm_raw.size else 0
+        diag["strong_confirm_valid_count"] = int(np.nansum(strong_confirm)) if strong_confirm.size else 0
+
+        diag["first_strong_primary_raw_epoch"] = first_true_epoch(strong_primary_raw, epochs)
+        diag["first_strong_primary_valid_epoch"] = first_true_epoch(strong_primary, epochs)
+        diag["first_strong_confirm_raw_epoch"] = first_true_epoch(strong_confirm_raw, epochs)
+        diag["first_strong_confirm_valid_epoch"] = first_true_epoch(strong_confirm, epochs)
+
+        # z_primary maxima (raw / valid)
+        if z_primary.size and np.any(np.isfinite(z_primary)):
+            ip = int(np.nanargmax(z_primary))
+            diag["z_primary_max"] = float(z_primary[ip]) if np.isfinite(z_primary[ip]) else None
+            diag["z_primary_max_epoch"] = int(df.loc[ip, "epoch"])
+        z_primary_valid = np.where(valid, z_primary, np.nan)
+        if z_primary_valid.size and np.any(np.isfinite(z_primary_valid)):
+            ipv = int(np.nanargmax(z_primary_valid))
+            diag["z_primary_valid_max"] = float(z_primary_valid[ipv]) if np.isfinite(z_primary_valid[ipv]) else None
+            diag["z_primary_valid_max_epoch"] = int(df.loc[ipv, "epoch"])
         return None, diag
 
     i = int(np.argmax(trigger))
@@ -506,6 +546,31 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
     # also store hit-related diag
     diag["self_break_epoch"] = int(epoch)
     diag["self_break_score"] = float(score)
+    diag["self_err_single_hard_count"] = int(np.nansum(single_hard))
+    diag["self_err_single_hard_strong_count"] = int(np.nansum(single_hard_strong))
+    diag["self_err_first_single_hard_epoch"] = first_true_epoch(single_hard, epochs)
+    diag["self_err_first_single_hard_strong_epoch"] = first_true_epoch(single_hard_strong, epochs)
+
+    # ---- extra diag: strong_primary/confirm (valid-aware) ----
+    diag["strong_primary_raw_count"] = int(np.nansum(strong_primary_raw)) if strong_primary_raw.size else 0
+    diag["strong_primary_valid_count"] = int(np.nansum(strong_primary)) if strong_primary.size else 0
+    diag["strong_confirm_raw_count"] = int(np.nansum(strong_confirm_raw)) if strong_confirm_raw.size else 0
+    diag["strong_confirm_valid_count"] = int(np.nansum(strong_confirm)) if strong_confirm.size else 0
+
+    diag["first_strong_primary_raw_epoch"] = first_true_epoch(strong_primary_raw, epochs)
+    diag["first_strong_primary_valid_epoch"] = first_true_epoch(strong_primary, epochs)
+    diag["first_strong_confirm_raw_epoch"] = first_true_epoch(strong_confirm_raw, epochs)
+    diag["first_strong_confirm_valid_epoch"] = first_true_epoch(strong_confirm, epochs)
+
+    if z_primary.size and np.any(np.isfinite(z_primary)):
+        ip = int(np.nanargmax(z_primary))
+        diag["z_primary_max"] = float(z_primary[ip]) if np.isfinite(z_primary[ip]) else None
+        diag["z_primary_max_epoch"] = int(df.loc[ip, "epoch"])
+    z_primary_valid = np.where(valid, z_primary, np.nan)
+    if z_primary_valid.size and np.any(np.isfinite(z_primary_valid)):
+        ipv = int(np.nanargmax(z_primary_valid))
+        diag["z_primary_valid_max"] = float(z_primary_valid[ipv]) if np.isfinite(z_primary_valid[ipv]) else None
+        diag["z_primary_valid_max_epoch"] = int(df.loc[ipv, "epoch"])
 
     return EventHit(epoch=epoch, kind="self_break", score=score, reason=reason), diag
 
@@ -520,7 +585,9 @@ def detect_self_shock(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
       - and NOT accompanied by strong self_err drift (otherwise self_break covers it)
     """
     require_cols(df, ["epoch", "self_m_tr", "d_self"])
-    base2 = drop_first_baseline_row(base, min_len=4)
+    # `base` is already self-baseline (first row removed in main()).
+    # Do NOT drop again here.
+    base2 = base
 
     dself = df["d_self"].to_numpy(dtype=float)
     dself_b = base2["d_self"].to_numpy(dtype=float)
