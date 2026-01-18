@@ -119,6 +119,13 @@ def flatten_record(payload: Dict) -> Dict:
         "self_err_med", "self_err_sigma",
         "d_self_med", "d_self_sigma",
         "d_selfm_med", "d_selfm_sigma",
+    
+        # baseline-inside spikes (diagnostic only; excluded from detection via valid mask)
+        "baseline_self_err_single_hard_count",
+        "baseline_self_err_single_strong_count",
+        "baseline_self_err_max_z",
+        "baseline_self_err_max_z_epoch",
+        "baseline_self_err_first_strong_epoch",
 
         "self_err_exceed_soft_count",
         "self_err_exceed_hard_count",
@@ -130,6 +137,15 @@ def flatten_record(payload: Dict) -> Dict:
         "self_err_first_persist_2consec_hard_epoch",
         "self_err_longest_run_soft",
         "self_err_longest_run_hard",
+
+        "strong_primary_raw_count",
+        "strong_primary_valid_count",
+        "strong_confirm_raw_count",
+        "strong_confirm_valid_count",
+        "z_primary_max",
+        "z_primary_max_epoch",
+        "z_primary_valid_max",
+        "z_primary_valid_max_epoch",
 
         "self_err_max_z",
         "self_err_max_z_epoch",
