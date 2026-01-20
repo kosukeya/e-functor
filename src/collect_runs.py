@@ -127,6 +127,20 @@ def flatten_record(payload: Dict) -> Dict:
         "baseline_self_err_max_z_epoch",
         "baseline_self_err_first_strong_epoch",
 
+        # ---- P direction summary (peak -> tail) ----
+        "p_peak_epoch",
+        "p_peak",
+        "p_tail_epoch",
+        "p_tail",
+        "p_tail_minus_peak",
+        "p_slope_after_peak",
+        "p_direction",
+
+        # ---- optional time series (only when --include_p_series) ----
+        "p_series_epoch",
+        "p_series_valid",
+        "p_series_z_primary_valid",
+
         "self_err_exceed_soft_count",
         "self_err_exceed_hard_count",
         "self_err_persist_2of3_soft_count",
@@ -160,8 +174,36 @@ def flatten_record(payload: Dict) -> Dict:
         else:
             row[f"diag_self_{k}"] = None
 
-    return row
+    # ---- derived P-direction column (in case older detect didn't output p_direction) ----
+    # Prefer explicit p_direction if present. Otherwise compute from tail_minus_peak if available.
+    pdir = row.get("diag_self_p_direction")
+    if not pdir:
+        d = row.get("diag_self_p_tail_minus_peak")
+        try:
+            d = float(d) if d is not None and d != "" else None
+        except Exception:
+            d = None
+        if d is None:
+            pdir = "Unknown"
+        else:
+            eps = 0.25
+            if d <= -eps:
+                pdir = "Recover"
+            elif d >= eps:
+                pdir = "Worsen"
+            else:
+                pdir = "Plateau"
+    row["p_direction"] = pdir
 
+    # Handy short numeric columns for ranking/filtering
+    row["p_peak_epoch"] = row.get("diag_self_p_peak_epoch")
+    row["p_peak"] = row.get("diag_self_p_peak")
+    row["p_tail_epoch"] = row.get("diag_self_p_tail_epoch")
+    row["p_tail"] = row.get("diag_self_p_tail")
+    row["p_tail_minus_peak"] = row.get("diag_self_p_tail_minus_peak")
+    row["p_slope_after_peak"] = row.get("diag_self_p_slope_after_peak")
+
+    return row
 
 def write_csv(rows: List[Dict], out_csv: str) -> None:
     # minimal CSV writer without pandas dependency

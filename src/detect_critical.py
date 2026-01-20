@@ -124,6 +124,63 @@ def argmax_finite(x: np.ndarray) -> Optional[int]:
 def fmt_stat(name: str, med: float, sig: float) -> str:
     return f"{name}: med={med:.6g}, sigma={sig:.6g}"
 
+def _p_direction_from_series(epochs: np.ndarray, z_primary_valid: np.ndarray, valid: np.ndarray) -> Dict:
+    """
+    Compute direction of P after its valid-peak.
+    Returns dict with:
+      p_peak_epoch, p_peak, p_tail_epoch, p_tail, p_tail_minus_peak,
+      p_slope_after_peak (optional), p_direction (Recover/Worsen/Plateau/Unknown)
+    """
+    out: Dict = {
+        "p_peak_epoch": None,
+        "p_peak": None,
+        "p_tail_epoch": None,
+        "p_tail": None,
+        "p_tail_minus_peak": None,
+        "p_slope_after_peak": None,
+        "p_direction": "Unknown",
+    }
+    if z_primary_valid is None or epochs is None or valid is None:
+        return out
+    if len(z_primary_valid) == 0:
+        return out
+    zv = np.where(valid, z_primary_valid, np.nan)
+    if not np.any(np.isfinite(zv)):
+        return out
+    ip = int(np.nanargmax(zv))
+    out["p_peak_epoch"] = int(epochs[ip])
+    out["p_peak"] = float(zv[ip])
+
+    idx_valid = np.where(np.isfinite(zv))[0]
+    it = int(idx_valid[-1])
+    out["p_tail_epoch"] = int(epochs[it])
+    out["p_tail"] = float(zv[it])
+    out["p_tail_minus_peak"] = float(zv[it] - zv[ip])
+
+    # slope after peak (only if we have >=2 finite points after peak)
+    aft = idx_valid[idx_valid >= ip]
+    if aft.size >= 2:
+        xa = epochs[aft].astype(float)
+        ya = zv[aft].astype(float)
+        x0 = xa[0]
+        denom = np.sum((xa - x0) ** 2)
+        if denom > 0:
+            slope = float(np.sum((xa - x0) * (ya - ya[0])) / denom)
+            out["p_slope_after_peak"] = slope
+
+    # direction (simple, robust): compare tail vs peak with small epsilon
+    eps = 0.25  # 0.25σ相当の差分は「ほぼ同じ」とみなす（必要なら調整）
+    d = out["p_tail_minus_peak"]
+    if d is None or not np.isfinite(d):
+        out["p_direction"] = "Unknown"
+    elif d <= -eps:
+        out["p_direction"] = "Recover"
+    elif d >= eps:
+        out["p_direction"] = "Worsen"
+    else:
+        out["p_direction"] = "Plateau"
+    return out
+
 def diagnose_self(df: pd.DataFrame, base_self: pd.DataFrame, self_target: float,
                   z_hard: float, z_soft: float) -> None:
     """
@@ -286,7 +343,9 @@ def _first_true_epoch(df: pd.DataFrame, mask: np.ndarray) -> Optional[int]:
     return int(df.loc[i, "epoch"])
 
 def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_soft: float,
-                      self_target: float) -> Tuple[Optional[EventHit], Dict]:
+                        self_target: float,
+                        debug_epoch: Optional[int] = None,
+                        debug_rows: int = 2) -> Tuple[Optional[EventHit], Dict]:
     """
     Self-break:
       primary: self_err = |self_m_tr - self_target| has z > z_hard (2 consecutive) OR z > z_soft (2/3)
@@ -297,6 +356,8 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
       - Promote d_self anomaly to PRIMARY as well (previously only confirm).
       - Add |Δ self_m_tr| anomaly as PRIMARY (helps with sparse logging).
       - OR-mix: allow strong primary even if confirm is weak, and vice versa (nearby).
+    baseline は “学習/初期化の揺れ” を含む可能性があるので、臨界検出には使わない
+    self 系イベントは baseline 終端以降のみ評価する
     """
     print(f"[DIAG][self] base len(before drop)={len(base) if base is not None else None}")
 
@@ -338,6 +399,25 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
 
     diag["self_err_med"] = float(med) if np.isfinite(med) else None
     diag["self_err_sigma"] = float(sig) if np.isfinite(sig) else None
+
+    # ---- baseline-only spike logging (NO effect on detection) ----
+    # baseline region is where valid==False, but keep the same warmup exclusion (idx 0)
+    idx = np.arange(len(df))
+    baseline_mask = (~valid) & (idx > 0) & np.isfinite(z)
+    diag["baseline_self_err_single_hard_count"] = int(np.nansum((z > z_hard) & baseline_mask)) if z.size else 0
+    diag["baseline_self_err_single_strong_count"] = int(np.nansum((z > (z_hard + SINGLE_HARD_MARGIN)) & baseline_mask)) if z.size else 0
+    if np.any(baseline_mask):
+        zb = np.where(baseline_mask, z, np.nan)
+        ib = int(np.nanargmax(zb)) if np.any(np.isfinite(zb)) else None
+        diag["baseline_self_err_max_z"] = float(z[ib]) if ib is not None and np.isfinite(z[ib]) else None
+        diag["baseline_self_err_max_z_epoch"] = int(df.loc[ib, "epoch"]) if ib is not None else None
+        # strong-first epoch (baseline only)
+        strong_b = (z > (z_hard + SINGLE_HARD_MARGIN)) & baseline_mask
+        diag["baseline_self_err_first_strong_epoch"] = first_true_epoch(strong_b, epochs)
+    else:
+        diag["baseline_self_err_max_z"] = None
+        diag["baseline_self_err_max_z_epoch"] = None
+        diag["baseline_self_err_first_strong_epoch"] = None
 
     # ===== DIAG: persistence / duration of exceedance for self_err =====
     epochs = df["epoch"].to_numpy(dtype=int)
@@ -445,6 +525,27 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
     # Diagnostics: single hard exceed should also respect `valid`
     single_hard = (z > z_hard) & valid
     single_hard_strong = (z > (z_hard + SINGLE_HARD_MARGIN)) & valid
+ 
+    # ---- small focused debug print around a specific epoch ----
+    if debug_epoch is not None:
+        # choose the closest row to debug_epoch (works even if epoch not logged exactly)
+        i0 = int(np.argmin(np.abs(epochs - int(debug_epoch))))
+        lo = max(0, i0 - int(debug_rows))
+        hi = min(len(df) - 1, i0 + int(debug_rows))
+        print(f"[DEBUG][self] focus_epoch={debug_epoch} closest_epoch={int(epochs[i0])} idx={i0} "
+              f"rows=[{lo}..{hi}] baseline_end_epoch={baseline_end_epoch}")
+        # header
+        print("[DEBUG][self] idx epoch valid  self_m_tr    self_err      z(self_err)   "
+              "d_self       z(d_self)    |Δself_m|    z(|Δself_m|)  "
+              "primary_err primary_dself primary_dselfm primary confirm_near strongP strongC trigger")
+        # placeholders for masks that are computed later in the function:
+        # we print what is available now, and later we will print a second block after trigger is built.
+        for i in range(lo, hi + 1):
+            dm_i = float(d_selfm[i]) if np.isfinite(d_selfm[i]) else float("nan")
+            print(f"[DEBUG][self] {i:3d} {int(epochs[i]):4d} {int(bool(valid[i])):5d} "
+                  f"{self_m[i]:10.6g} {self_err[i]:12.6g} {z[i]:12.4f} "
+                  f"{dself[i]:10.6g} {z_ds[i]:12.4f} {dm_i:10.6g} {z_dm[i]:12.4f} "
+                  f"{'-':>10} {'-':>12} {'-':>13} {'-':>7} {'-':>12} {'-':>7} {'-':>7} {'-':>7}")
 
     # primary components
     primary_err = hard | soft | abs_gate | single_hard_strong
@@ -493,6 +594,21 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
     # NOTE: trigger itself remains valid-gated, but we also keep raw masks for diagnostics.
     trigger = ((primary & confirm_near) | strong_primary_raw | (strong_confirm_raw & primary)) & valid
 
+    # ---- second focused debug block (now that primary/confirm/trigger exist) ----
+    if debug_epoch is not None:
+        i0 = int(np.argmin(np.abs(epochs - int(debug_epoch))))
+        lo = max(0, i0 - int(debug_rows))
+        hi = min(len(df) - 1, i0 + int(debug_rows))
+        # recompute the three "primary parts" flags for printing (they already exist as arrays)
+        # primary_err / primary_dself / primary_dselfm exist above
+        for i in range(lo, hi + 1):
+            print(f"[DEBUG][self] {i:3d} {int(epochs[i]):4d} {int(bool(valid[i])):5d} "
+                  f"{self_m[i]:10.6g} {self_err[i]:12.6g} {z[i]:12.4f} "
+                  f"{dself[i]:10.6g} {z_ds[i]:12.4f} {float(d_selfm[i]):10.6g} {z_dm[i]:12.4f} "
+                  f"{int(bool(primary_err[i])):10d} {int(bool(primary_dself[i])):12d} {int(bool(primary_dselfm[i])):13d} "
+                  f"{int(bool(primary[i])):7d} {int(bool(confirm_near[i])):12d} "
+                  f"{int(bool(strong_primary_raw[i])):7d} {int(bool(strong_confirm_raw[i])):7d} {int(bool(trigger[i])):7d}")
+
     if not np.any(trigger):
         # add a few max stats to diag even when no hit
         if z.size:
@@ -528,6 +644,13 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
             ipv = int(np.nanargmax(z_primary_valid))
             diag["z_primary_valid_max"] = float(z_primary_valid[ipv]) if np.isfinite(z_primary_valid[ipv]) else None
             diag["z_primary_valid_max_epoch"] = int(df.loc[ipv, "epoch"])
+
+        # ---- P-direction summary (peak -> tail) ----
+        pdict = _p_direction_from_series(epochs=epochs, z_primary_valid=z_primary, valid=valid)
+        # NOTE: function expects "z_primary_valid-like" array + valid; we pass raw z_primary and gate by valid inside.
+        # (ここでは valid で NaN 化するのでOK)
+        diag.update(pdict)
+        
         return None, diag
 
     i = int(np.argmax(trigger))
@@ -567,10 +690,23 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
         diag["z_primary_max"] = float(z_primary[ip]) if np.isfinite(z_primary[ip]) else None
         diag["z_primary_max_epoch"] = int(df.loc[ip, "epoch"])
     z_primary_valid = np.where(valid, z_primary, np.nan)
+ 
+    # ---- store P series into diag (so json_out can carry it without recompute) ----
+    # Keep it lightweight: lists of numbers (NaN -> None) + valid mask
+    diag["p_series_epoch"] = [int(e) for e in epochs.tolist()]
+    diag["p_series_valid"] = [bool(v) for v in valid.tolist()]
+    diag["p_series_z_primary_valid"] = [
+        (None if not np.isfinite(v) else float(v)) for v in z_primary_valid.tolist()
+    ]
+
     if z_primary_valid.size and np.any(np.isfinite(z_primary_valid)):
         ipv = int(np.nanargmax(z_primary_valid))
         diag["z_primary_valid_max"] = float(z_primary_valid[ipv]) if np.isfinite(z_primary_valid[ipv]) else None
         diag["z_primary_valid_max_epoch"] = int(df.loc[ipv, "epoch"])
+
+    # ---- P-direction summary (peak -> tail) ----
+    pdict = _p_direction_from_series(epochs=epochs, z_primary_valid=z_primary, valid=valid)
+    diag.update(pdict)
 
     return EventHit(epoch=epoch, kind="self_break", score=score, reason=reason), diag
 
@@ -694,6 +830,12 @@ def main():
     ap.add_argument("--print_head", action="store_true")
     ap.add_argument("--json_out", type=str, default=None,
                     help="If set, write result JSON to this path.")
+    ap.add_argument("--include_p_series", action="store_true",
+                    help="If set, include z_primary_valid time series in JSON (diag.self.p_series).")
+    ap.add_argument("--debug_epoch", type=int, default=None,
+                    help="If set, print detailed self-break diagnostics around this epoch (closest logged row).")
+    ap.add_argument("--debug_rows", type=int, default=2,
+                    help="Number of rows before/after the closest debug_epoch row to print (default=2).")
     args = ap.parse_args()
 
     df = pd.read_csv(args.csv_path)
@@ -772,7 +914,8 @@ def main():
 
     diag_self: Dict = {}
     self_hit, diag_self = detect_self_break(
-        df, base_self, z_hard=z_hard, z_soft=z_soft, self_target=self_target
+        df, base_self, z_hard=z_hard, z_soft=z_soft, self_target=self_target,
+        debug_epoch=args.debug_epoch, debug_rows=args.debug_rows
     )
     if self_hit is not None:
         events.append(self_hit)
@@ -847,6 +990,12 @@ def main():
             } if first else None,
              "diag": {"self": diag_self},
         }
+ 
+        # If not requested, remove the series to keep JSON small
+        if (not args.include_p_series) and ("diag" in payload) and ("self" in payload["diag"]):
+            for k in ["p_series_epoch", "p_series_valid", "p_series_z_primary_valid"]:
+                payload["diag"]["self"].pop(k, None)
+
         with open(args.json_out, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
 
