@@ -60,6 +60,13 @@ def main():
     ap.add_argument("--include_p_series", action="store_true")
     ap.add_argument("--recompute", action="store_true",
                     help="Re-run detect even if <run_dir>/critical.json exists")
+    # --- Recover minimum conditions (new) ---
+    ap.add_argument("--drop_min", type=float, default=0.30,
+                    help="Minimum required drop to call Recover: (Ppeak - Ptail_mean) >= drop_min")
+    ap.add_argument("--tail_n", type=int, default=2,
+                    help="How many tail points to average for Ptail_mean (use >=2 for sparse logs).")
+    ap.add_argument("--min_tail_points", type=int, default=2,
+                    help="Require at least this many finite tail points to allow Recover.")
     args = ap.parse_args()
 
     detect_py = os.path.abspath(args.detect)
@@ -86,6 +93,74 @@ def main():
         thresholds = payload.get("thresholds") or {}
         baseline = payload.get("baseline") or {}
 
+        # -----------------------------
+        # Recompute p_direction with minimum Recover conditions (new)
+        # -----------------------------
+        def _to_float(x):
+            try:
+                return float(x)
+            except Exception:
+                return None
+
+        p_peak = _to_float(diag_self.get("p_peak"))
+        p_tail = _to_float(diag_self.get("p_tail"))
+        slope = _to_float(diag_self.get("p_slope_after_peak"))
+
+        # Try to read p-series from JSON (when --include_p_series is used).
+        # We accept several possible key names to be robust.
+        p_series = diag_self.get("p_series_valid")
+        if p_series is None:
+            p_series = diag_self.get("p_series")
+        if p_series is None:
+            p_series = diag_self.get("z_primary_valid_series")  # if you used another name
+
+        # Compute tail mean from last N finite points if series exists; otherwise fallback to last point.
+        tail_n = max(1, int(args.tail_n))
+        tail_points = 0
+        p_tail_mean = None
+
+        if isinstance(p_series, list) and len(p_series) > 0:
+            tail_slice = p_series[-tail_n:]
+            finite = []
+            for v in tail_slice:
+                fv = _to_float(v)
+                if fv is not None:
+                    # allow NaN check
+                    if fv == fv:  # not NaN
+                        finite.append(fv)
+            tail_points = len(finite)
+            if tail_points > 0:
+                p_tail_mean = sum(finite) / float(tail_points)
+        else:
+            # fallback
+            if p_tail is not None and (p_tail == p_tail):  # not NaN
+                p_tail_mean = p_tail
+                tail_points = 1
+            else:
+                p_tail_mean = None
+                tail_points = 0
+
+        # drop and minimum condition
+        drop = None
+        if (p_peak is not None) and (p_tail_mean is not None):
+            drop = p_peak - p_tail_mean
+
+        min_ok = (
+            (drop is not None) and (drop >= float(args.drop_min)) and
+            (tail_points >= int(args.min_tail_points))
+        )
+
+        # Re-judge direction with the new minimum condition.
+        # (Keep it conservative: Recover only when slope is negative AND min_ok.)
+        p_direction_min = None
+        if (slope is not None) and (p_peak is not None) and (p_tail_mean is not None):
+            if (slope < 0.0) and min_ok:
+                p_direction_min = "Recover"
+            elif slope > 0.0 and (p_tail_mean - p_peak) > 0.0:
+                p_direction_min = "Worsen"
+            else:
+                p_direction_min = "Plateau"
+
         row = {
             "run_name": run_name,
             "csv_path": payload.get("csv_path"),
@@ -111,6 +186,12 @@ def main():
             "p_tail": diag_self.get("p_tail"),
             "p_tail_minus_peak": diag_self.get("p_tail_minus_peak"),
             "p_slope_after_peak": diag_self.get("p_slope_after_peak"),
+            # P-direction (re-judged with Recover minimum conditions)
+            "p_tail_mean": p_tail_mean,
+            "p_tail_points": tail_points,
+            "p_drop_peak_to_tail_mean": drop,
+            "p_recover_min_ok": min_ok,
+            "p_direction_min": p_direction_min,
         }
         rows.append(row)
 
@@ -130,12 +211,11 @@ def main():
     # print a compact console summary
     print()
     for r in rows:
-        print(f"- {r['run_name']}: {r.get('p_direction')}  "
+        print(f"- {r['run_name']}: {r.get('p_direction_min')} (raw={r.get('p_direction')})  "
               f"Ppeak={r.get('p_peak')}@{r.get('p_peak_epoch')}  "
-              f"Ptail={r.get('p_tail')}@{r.get('p_tail_epoch')}  "
-              f"Δ={r.get('p_tail_minus_peak')}  "
+              f"PtailMean={r.get('p_tail_mean')} (pts={r.get('p_tail_points')})  "
+              f"drop={r.get('p_drop_peak_to_tail_mean')}  "
               f"slope={r.get('p_slope_after_peak')}")
-
 
 if __name__ == "__main__":
     main()
