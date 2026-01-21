@@ -942,25 +942,25 @@ def main():
         diagnose_self(df, base_self, self_target=self_target, z_hard=z_hard, z_soft=z_soft)
         print()
 
-
-
     if not events:
         print("No break detected under current thresholds.")
-        return
+        first = None
+    else:
+        for e in sorted(events, key=lambda x: x.epoch):
+            print(f"- {e.kind}: epoch={e.epoch}, score={e.score:.2f}")
+            print(f"  reason: {e.reason}")
 
-    for e in sorted(events, key=lambda x: x.epoch):
-        print(f"- {e.kind}: epoch={e.epoch}, score={e.score:.2f}")
-        print(f"  reason: {e.reason}")
+        # FIRST BREAK: ignore self_shock unless it is the only event kind present
+        events_for_first = [e for e in events if e.kind != "self_shock"]
+        if not events_for_first:
+            events_for_first = events
+        first = pick_first_event(events_for_first)
+        print()
+        print("---- FIRST BREAK (critical epoch) ----")
+        print(f"kind={first.kind}  epoch={first.epoch}  score={first.score:.2f}")
+        print(f"reason: {first.reason}")
 
-    # FIRST BREAK: ignore self_shock unless it is the only event kind present
-    events_for_first = [e for e in events if e.kind != "self_shock"]
-    if not events_for_first:
-        events_for_first = events
-    first = pick_first_event(events_for_first)
-    print()
-    print("---- FIRST BREAK (critical epoch) ----")
-    print(f"kind={first.kind}  epoch={first.epoch}  score={first.score:.2f}")
-    print(f"reason: {first.reason}")
+    # (events が無い場合も first=None のまま続行し、json_out があれば書く)
 
     # ---- JSON output (optional) ----
     if args.json_out:

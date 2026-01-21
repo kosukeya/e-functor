@@ -174,6 +174,22 @@ ISLAND_MAX_SAMPLES = int(os.environ.get("ISLAND_MAX_SAMPLES", "512"))
 # epoch % LOG_EVERY == 0 のタイミングで保存（必要なら環境変数で上書き）
 ISLAND_EVERY = int(os.environ.get("ISLAND_EVERY", str(C.LOG_EVERY)))
 
+# -----------------------------
+# tail logging (increase points near the end)
+# -----------------------------
+# Tail logging can be configured by env vars:
+#   TAIL_START : epoch from which we densify logs (default: last ~6*LOG_EVERY range)
+#   TAIL_EVERY : logging interval during tail (default: LOG_EVERY//4)
+TAIL_START = int(os.environ.get("TAIL_START", str(max(0, C.EPOCHS - 6 * C.LOG_EVERY))))
+TAIL_EVERY = int(os.environ.get("TAIL_EVERY", str(max(1, C.LOG_EVERY // 4))))
+
+def should_log_epoch(epoch: int) -> bool:
+    if epoch % C.LOG_EVERY == 0:
+        return True
+    if epoch >= TAIL_START and (epoch % TAIL_EVERY == 0):
+        return True
+    return False
+
 @torch.no_grad()
 def save_island_snapshot(
     model: MultiIWorldModel,
@@ -467,7 +483,7 @@ def main():
         lr_now = C.LR * mult
         for pg in opt.param_groups:
             pg["lr"] = lr_now
-        if epoch % C.LOG_EVERY == 0:
+        if should_log_epoch(epoch):
             print(f"[LR] epoch={epoch} mult={mult:.4f} lr={lr_now:.6g}")
 
         model.train()
@@ -534,7 +550,7 @@ def main():
         fstat.ema_update(model)
         _ = fstat_loss(fstat, train_data, device=C.device, base_loss_weight=0.1, meaning_weight=0.05)
 
-        if epoch % C.LOG_EVERY == 0:
+        if should_log_epoch(epoch):
             model.eval()
             with torch.no_grad():
                 val_L_sem = loss_real_sem_log(model, val_data)
