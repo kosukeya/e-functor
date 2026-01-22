@@ -188,6 +188,8 @@ def should_log_epoch(epoch: int) -> bool:
         return True
     if epoch >= TAIL_START and (epoch % TAIL_EVERY == 0):
         return True
+    if epoch == C.EPOCHS - 1:
+        return True
     return False
 
 @torch.no_grad()
@@ -373,6 +375,8 @@ def main():
         f"self_target={self_target_val}"
     )
 
+    # ---- tail logging (more points in late phase) ----
+    print(f"[TAIL] start={TAIL_START} every={TAIL_EVERY} (LOG_EVERY={C.LOG_EVERY})")
 
     # ---- Output paths (RUN_DIR based) ----
     LOG_PATH = RUN_DIR / "alpha_log.csv"
