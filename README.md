@@ -1,3 +1,8 @@
+# 自分用メモ
+1. 意味＝何の不変性か
+2. ε＝その不変性の破れ方の測定
+3. 破れ方＝崩壊タイプの分類
+
 # e-functor
 
 A Structural Approach to Meaning, Stability, and Intervention in Neural Models
