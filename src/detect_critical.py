@@ -124,7 +124,14 @@ def argmax_finite(x: np.ndarray) -> Optional[int]:
 def fmt_stat(name: str, med: float, sig: float) -> str:
     return f"{name}: med={med:.6g}, sigma={sig:.6g}"
 
-def _p_direction_from_series(epochs: np.ndarray, z_primary_valid: np.ndarray, valid: np.ndarray) -> Dict:
+def _p_direction_from_series(
+    epochs: np.ndarray,
+    z_primary_valid: np.ndarray,
+    valid: np.ndarray,
+    *,
+    recover_requires_abnormal: bool = False,
+    abnormal_threshold: float = 3.0,
+) -> Dict:
     """
     Compute direction of P after its valid-peak.
     Returns dict with:
@@ -134,6 +141,7 @@ def _p_direction_from_series(epochs: np.ndarray, z_primary_valid: np.ndarray, va
     out: Dict = {
         "p_peak_epoch": None,
         "p_peak": None,
+        "p_peak_abnormal": None,
         "p_tail_epoch": None,
         "p_tail": None,
         "p_tail_minus_peak": None,
@@ -150,6 +158,11 @@ def _p_direction_from_series(epochs: np.ndarray, z_primary_valid: np.ndarray, va
     ip = int(np.nanargmax(zv))
     out["p_peak_epoch"] = int(epochs[ip])
     out["p_peak"] = float(zv[ip])
+    # abnormal = peak is at/above threshold (typically z_soft)
+    if np.isfinite(out["p_peak"]):
+        out["p_peak_abnormal"] = bool(out["p_peak"] >= float(abnormal_threshold))
+    else:
+        out["p_peak_abnormal"] = None
 
     idx_valid = np.where(np.isfinite(zv))[0]
     it = int(idx_valid[-1])
@@ -175,11 +188,328 @@ def _p_direction_from_series(epochs: np.ndarray, z_primary_valid: np.ndarray, va
         out["p_direction"] = "Unknown"
     elif d <= -eps:
         out["p_direction"] = "Recover"
+        # Gate Recover if requested
+        if recover_requires_abnormal:
+            if out.get("p_peak_abnormal") is True:
+                out["p_direction"] = "Recover"
+            else:
+                # if it "recovers" but never was abnormal, treat as Plateau (or Unknown)
+                out["p_direction"] = "Plateau"
+        else:
+            out["p_direction"] = "Recover"
     elif d >= eps:
         out["p_direction"] = "Worsen"
     else:
         out["p_direction"] = "Plateau"
     return out
+
+def _baseline_end_epoch_from_base(base: pd.DataFrame) -> Optional[int]:
+    if base is None or len(base) == 0 or ("epoch" not in base.columns):
+        return None
+    x = base["epoch"].to_numpy(dtype=float)
+    if x.size == 0 or not np.any(np.isfinite(x)):
+        return None
+    return int(np.nanmax(x))
+
+
+def _valid_mask_after_baseline(df: pd.DataFrame, baseline_end_epoch: Optional[int]) -> np.ndarray:
+    epochs = df["epoch"].to_numpy(dtype=int)
+    idx = np.arange(len(df))
+    valid = np.ones(len(df), dtype=bool)
+    valid[0] = False  # warmup
+    if baseline_end_epoch is not None and np.isfinite(baseline_end_epoch):
+        valid &= (epochs > int(baseline_end_epoch))
+    return valid
+
+
+def _robust_z_from_base(series: np.ndarray, base_series: np.ndarray) -> Tuple[np.ndarray, float, float]:
+    med, sig = robust_stats(base_series.astype(float))
+    z = robust_z(series.astype(float), med, sig)
+    return z, float(med) if np.isfinite(med) else np.nan, float(sig) if np.isfinite(sig) else np.nan
+
+def decide_eps_type(z_at: Dict[str, float], z_soft: float, z_hard: float) -> Dict:
+    """
+    Decide eps-type at peak epoch using z-scores.
+    Input keys:
+      RULE_cf, RULE_mono, FRAME_att, SELF_self, BEHAV_dC, EPS
+    Output:
+      eps_type, eps_type_top2, eps_hidden, eps_behavior, eps_confidence, ...
+    """
+    # Extract with NaN-safe
+    def g(k):
+        v = z_at.get(k, np.nan)
+        return float(v) if (v is not None and np.isfinite(v)) else float("nan")
+
+    z_rule_cf   = g("RULE_cf")
+    z_rule_mono = g("RULE_mono")
+    z_frame     = g("FRAME_att")
+    z_self      = g("SELF_self")
+    z_dC        = g("BEHAV_dC")
+    z_eps       = g("EPS")
+
+    # Aggregate rule (cf+mono): take max (not sum) for "dominant channel" semantics
+    z_rule = np.nanmax([z_rule_cf, z_rule_mono])
+
+    # rank top2 among meaning components
+    comps = [
+        ("RULE", z_rule),
+        ("FRAME", z_frame),
+        ("SELF", z_self),
+    ]
+    # filter finite
+    comps_f = [(k, v) for (k, v) in comps if np.isfinite(v)]
+    comps_f.sort(key=lambda kv: kv[1], reverse=True)
+    top1 = comps_f[0] if comps_f else ("Unknown", float("nan"))
+    top2 = comps_f[1] if len(comps_f) >= 2 else ("Unknown", float("nan"))
+
+    # -------------------------
+    # HIDDEN / BEHAVIOR gating
+    # -------------------------
+    # HIDDEN: meaning instability (epsilon) is clearly high, but behavioral change (dC) is not.
+    # Use margins to avoid flapping near thresholds.
+    HIDDEN_EPS = z_soft          # eps must be at least soft-level abnormal
+    HIDDEN_DC  = (z_soft - 0.5)  # dC must be not-abnormal (below soft minus margin)
+    hidden = (np.isfinite(z_eps) and (z_eps >= HIDDEN_EPS)) and (np.isfinite(z_dC) and (z_dC <= HIDDEN_DC))
+
+    # BEHAVIOR: behavior changed a lot, but epsilon didn't (or is negative-ish / small).
+    BEHAV_DC = z_soft
+    BEHAV_EPS_MAX = 1.0  # conservative: "eps is basically not spiking"
+    behavior = (np.isfinite(z_dC) and (z_dC >= BEHAV_DC)) and ((not np.isfinite(z_eps)) or (z_eps <= BEHAV_EPS_MAX))
+
+    # choose type
+    # Priority:
+    # - hidden overrides (because it is semantically special)
+    # - behavior overrides only when meaning components are not clearly high
+    # - else use top1 among meaning components
+    eps_type = None
+    if hidden:
+        eps_type = "HIDDEN"
+    elif behavior and (not np.isfinite(top1[1]) or top1[1] < z_soft):
+        eps_type = "BEHAVIOR"
+    else:
+        eps_type = top1[0] if top1[0] != "Unknown" else "Unknown"
+
+    # confidence score: how far above z_soft the chosen evidence is (clip at 0)
+    if eps_type == "HIDDEN":
+        conf = (z_eps - z_soft) if np.isfinite(z_eps) else 0.0
+    elif eps_type == "BEHAVIOR":
+        conf = (z_dC - z_soft) if np.isfinite(z_dC) else 0.0
+    else:
+        conf = (top1[1] - z_soft) if np.isfinite(top1[1]) else 0.0
+    conf = float(max(0.0, conf))
+
+    # top2 string
+    top2_str = f"{top1[0]}:{top1[1]:.2f}" if np.isfinite(top1[1]) else f"{top1[0]}:NaN"
+    top2_str += " | "
+    top2_str += f"{top2[0]}:{top2[1]:.2f}" if np.isfinite(top2[1]) else f"{top2[0]}:NaN"
+
+    return {
+        "eps_type": eps_type,
+        "eps_type_top2": top2_str,
+        "eps_hidden": bool(hidden),
+        "eps_behavior": bool(behavior),
+        "eps_z_at_peak": {
+            "z_rule_cf": (None if not np.isfinite(z_rule_cf) else float(z_rule_cf)),
+            "z_rule_mono": (None if not np.isfinite(z_rule_mono) else float(z_rule_mono)),
+            "z_rule": (None if not np.isfinite(z_rule) else float(z_rule)),
+            "z_frame": (None if not np.isfinite(z_frame) else float(z_frame)),
+            "z_self": (None if not np.isfinite(z_self) else float(z_self)),
+            "z_dC": (None if not np.isfinite(z_dC) else float(z_dC)),
+            "z_eps": (None if not np.isfinite(z_eps) else float(z_eps)),
+        },
+        "eps_confidence": conf,
+    }
+
+def compute_eps_component_P(df: pd.DataFrame, base: pd.DataFrame,
+                            z_soft: float, z_hard: float,
+                            weights: Optional[Dict[str, float]] = None) -> Dict:
+    """
+    Build epsilon-component based P(t) and type labels.
+
+    Components (default weights=1):
+      e_cf   = w_cf   * d_cf
+      e_mono = w_mono * d_mono
+      e_att  = w_att  * d_att
+      e_self = w_self * d_self
+    Also monitors:
+      z_dC, z_epsilon
+    P_eps(t) = max(z_e_cf, z_e_mono, z_e_att, z_e_self) (valid-gated)
+    """
+    w = dict(w_cf=1.0, w_mono=1.0, w_att=1.0, w_self=1.0)
+    if weights:
+        w.update(weights)
+
+    require_cols(df, ["epoch", "epsilon", "dC", "d_cf", "d_mono", "d_att", "d_self"])
+    require_cols(base, ["epoch", "epsilon", "dC", "d_cf", "d_mono", "d_att", "d_self"])
+
+    # valid mask: after baseline
+    baseline_end_epoch = _baseline_end_epoch_from_base(base)
+    valid = _valid_mask_after_baseline(df, baseline_end_epoch)
+
+    # series
+    eps = df["epsilon"].to_numpy(dtype=float)
+    dC  = df["dC"].to_numpy(dtype=float)
+
+    e_cf   = w["w_cf"]   * df["d_cf"].to_numpy(dtype=float)
+    e_mono = w["w_mono"] * df["d_mono"].to_numpy(dtype=float)
+    e_att  = w["w_att"]  * df["d_att"].to_numpy(dtype=float)
+    e_self = w["w_self"] * df["d_self"].to_numpy(dtype=float)
+
+    # baseline series
+    eps_b = base["epsilon"].to_numpy(dtype=float)
+    dC_b  = base["dC"].to_numpy(dtype=float)
+    e_cf_b   = w["w_cf"]   * base["d_cf"].to_numpy(dtype=float)
+    e_mono_b = w["w_mono"] * base["d_mono"].to_numpy(dtype=float)
+    e_att_b  = w["w_att"]  * base["d_att"].to_numpy(dtype=float)
+    e_self_b = w["w_self"] * base["d_self"].to_numpy(dtype=float)
+
+    # robust z
+    z_eps,   med_eps,   sig_eps   = _robust_z_from_base(eps, eps_b)
+    z_dC,    med_dC,    sig_dC    = _robust_z_from_base(dC,  dC_b)
+    z_ecf,   med_ecf,   sig_ecf   = _robust_z_from_base(e_cf,   e_cf_b)
+    z_emono, med_emono, sig_emono = _robust_z_from_base(e_mono, e_mono_b)
+    z_eatt,  med_eatt,  sig_eatt  = _robust_z_from_base(e_att,  e_att_b)
+    z_eself, med_eself, sig_eself = _robust_z_from_base(e_self, e_self_b)
+
+    # ============================================================
+    # (3) P_eps definition (integrated patch):
+    #   Old: P_raw = max(z_ecf, z_emono, z_eatt, z_eself)
+    #   New: P_excess = max(0, z_rule - z_soft, 0, z_frame - z_soft, 0, z_self - z_soft)
+    #        where z_rule = max(z_ecf, z_emono), z_frame = z_eatt, z_self = z_eself
+    #   -> prevents negative/small values from creating spurious "Recover".
+    # ============================================================
+    z_rule = safe_nanmax_stack([z_ecf, z_emono], axis=0)   # RULE channel (cf/mono)
+    z_frame = z_eatt                                      # FRAME channel
+    z_selfc = z_eself                                     # SELF channel
+ 
+    ex_rule  = np.maximum(0.0, z_rule  - float(z_soft))
+    ex_frame = np.maximum(0.0, z_frame - float(z_soft))
+    ex_self  = np.maximum(0.0, z_selfc - float(z_soft))
+    P_excess_raw = safe_nanmax_stack([ex_rule, ex_frame, ex_self], axis=0)
+    P_excess = np.where(valid, P_excess_raw, np.nan)
+
+    epochs = df["epoch"].to_numpy(dtype=int)
+
+    # peak (valid)
+    if np.any(np.isfinite(P_excess)):
+        ip = int(np.nanargmax(P_excess))
+        peak_epoch = int(epochs[ip])
+        peak_val = float(P_excess[ip])
+    else:
+        ip = None
+        peak_epoch = None
+        peak_val = None
+
+    # compute direction from peak to tail using existing helper
+    pdict = _p_direction_from_series(epochs=epochs, z_primary_valid=P_excess_raw, valid=valid)
+ 
+    # ============================================================
+    # (1) Recover gating (integrated patch):
+    #   Allow "Recover" only when the peak itself is in abnormal region.
+    #   With excess-definition, abnormal iff peak_val > 0.
+    # ============================================================
+    peak_abnormal = (peak_val is not None) and np.isfinite(peak_val) and (float(peak_val) > 0.0)
+    if pdict.get("p_direction") == "Recover" and (not peak_abnormal):
+        # If there was no abnormal peak, "Recover" is meaningless -> downgrade.
+        pdict["p_direction"] = "Plateau"
+
+    # ---- type labeling at peak ----
+    type_dict = {}
+    if ip is not None:
+        z_at = {
+            "RULE_cf":   float(z_ecf[ip])   if np.isfinite(z_ecf[ip]) else np.nan,
+            "RULE_mono": float(z_emono[ip]) if np.isfinite(z_emono[ip]) else np.nan,
+            "FRAME_att": float(z_eatt[ip])  if np.isfinite(z_eatt[ip]) else np.nan,
+            "SELF_self": float(z_eself[ip]) if np.isfinite(z_eself[ip]) else np.nan,
+            "BEHAV_dC":  float(z_dC[ip])    if np.isfinite(z_dC[ip]) else np.nan,
+            "EPS":       float(z_eps[ip])   if np.isfinite(z_eps[ip]) else np.nan,
+        }
+        type_dict = decide_eps_type(z_at, z_soft=z_soft, z_hard=z_hard)
+ 
+        # ============================================================
+        # (2) eps_type gating (integrated patch):
+        #   Output eps_type only in abnormal situations.
+        #   Otherwise set eps_type to NORMAL (or NONE) to avoid noisy labels.
+        #   Abnormal means:
+        #     - any meaning component >= z_soft, OR
+        #     - hidden/behavior is True (special abnormal), OR
+        #     - (optionally) z_eps >= z_soft (meaning-instability)
+        # ============================================================
+        z_rule_here  = float(type_dict.get("eps_z_at_peak", {}).get("z_rule", np.nan))
+        z_frame_here = float(type_dict.get("eps_z_at_peak", {}).get("z_frame", np.nan))
+        z_self_here  = float(type_dict.get("eps_z_at_peak", {}).get("z_self", np.nan))
+        z_eps_here   = float(type_dict.get("eps_z_at_peak", {}).get("z_eps", np.nan))
+ 
+        top_mean = np.nanmax([z_rule_here, z_frame_here, z_self_here])
+        is_hidden = bool(type_dict.get("eps_hidden", False))
+        is_behav  = bool(type_dict.get("eps_behavior", False))
+ 
+        abnormal_for_label = (
+            (np.isfinite(top_mean) and (top_mean >= float(z_soft))) or
+            is_hidden or
+            is_behav or
+            (np.isfinite(z_eps_here) and (z_eps_here >= float(z_soft)))
+        )
+ 
+        if not abnormal_for_label:
+            # Keep eps_z_at_peak for debugging, but normalize the label outputs.
+            type_dict["eps_type"] = "NORMAL"      # or "NONE"
+            type_dict["eps_type_top2"] = "NORMAL"
+            type_dict["eps_hidden"] = False
+            type_dict["eps_behavior"] = False
+            type_dict["eps_confidence"] = 0.0
+
+    # series export (lightweight)
+    def _to_list(x):
+        return [(None if (v is None or not np.isfinite(v)) else float(v)) for v in x.tolist()]
+
+    out = {
+        "baseline_end_epoch": baseline_end_epoch,
+        "valid_n": int(np.nansum(valid)),
+        "z_meds": {
+            "eps": med_eps, "dC": med_dC,
+            "e_cf": med_ecf, "e_mono": med_emono, "e_att": med_eatt, "e_self": med_eself
+        },
+        "z_sigs": {
+            "eps": sig_eps, "dC": sig_dC,
+            "e_cf": sig_ecf, "e_mono": sig_emono, "e_att": sig_eatt, "e_self": sig_eself
+        },
+
+        # peak info
+        "p_eps_peak_epoch": peak_epoch,
+        "p_eps_peak": peak_val,
+        "p_eps_peak_abnormal": bool(peak_abnormal),
+        "p_eps_peak_raw_z": (None if ip is None else {
+            "z_rule":  (None if not np.isfinite(z_rule[ip])  else float(z_rule[ip])),
+            "z_frame": (None if not np.isfinite(z_frame[ip]) else float(z_frame[ip])),
+            "z_self":  (None if not np.isfinite(z_selfc[ip]) else float(z_selfc[ip])),
+            "z_eps":   (None if not np.isfinite(z_eps[ip])   else float(z_eps[ip])),
+            "z_dC":    (None if not np.isfinite(z_dC[ip])    else float(z_dC[ip])),
+        }),
+
+        # direction info (reusing keys but namespaced)
+        "p_eps_direction": pdict.get("p_direction"),
+        "p_eps_tail_epoch": pdict.get("p_tail_epoch"),
+        "p_eps_tail": pdict.get("p_tail"),
+        "p_eps_tail_minus_peak": pdict.get("p_tail_minus_peak"),
+        "p_eps_slope_after_peak": pdict.get("p_slope_after_peak"),
+
+        # type labels
+        **type_dict,
+
+        # series
+        "p_eps_series_epoch": [int(e) for e in epochs.tolist()],
+        "p_eps_series_valid": [bool(v) for v in valid.tolist()],
+        "p_eps_series_P_valid": _to_list(np.where(valid, P_excess_raw, np.nan)),
+        "p_eps_series_z_eps_valid": _to_list(np.where(valid, z_eps, np.nan)),
+        "p_eps_series_z_dC_valid": _to_list(np.where(valid, z_dC, np.nan)),
+        "p_eps_series_z_ecf_valid": _to_list(np.where(valid, z_ecf, np.nan)),
+        "p_eps_series_z_emono_valid": _to_list(np.where(valid, z_emono, np.nan)),
+        "p_eps_series_z_eatt_valid": _to_list(np.where(valid, z_eatt, np.nan)),
+        "p_eps_series_z_eself_valid": _to_list(np.where(valid, z_eself, np.nan)),
+    }
+    return out
+
 
 def diagnose_self(df: pd.DataFrame, base_self: pd.DataFrame, self_target: float,
                   z_hard: float, z_soft: float) -> None:
@@ -646,7 +976,13 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
             diag["z_primary_valid_max_epoch"] = int(df.loc[ipv, "epoch"])
 
         # ---- P-direction summary (peak -> tail) ----
-        pdict = _p_direction_from_series(epochs=epochs, z_primary_valid=z_primary, valid=valid)
+        pdict = _p_direction_from_series(
+            epochs=epochs,
+            z_primary_valid=z_primary,
+            valid=valid,
+            recover_requires_abnormal=True,
+            abnormal_threshold=float(z_soft),
+        )
         # NOTE: function expects "z_primary_valid-like" array + valid; we pass raw z_primary and gate by valid inside.
         # (ここでは valid で NaN 化するのでOK)
         diag.update(pdict)
@@ -705,7 +1041,13 @@ def detect_self_break(df: pd.DataFrame, base: pd.DataFrame, z_hard: float, z_sof
         diag["z_primary_valid_max_epoch"] = int(df.loc[ipv, "epoch"])
 
     # ---- P-direction summary (peak -> tail) ----
-    pdict = _p_direction_from_series(epochs=epochs, z_primary_valid=z_primary, valid=valid)
+    pdict = _p_direction_from_series(
+        epochs=epochs,
+        z_primary_valid=z_primary,
+        valid=valid,
+        recover_requires_abnormal=True,
+        abnormal_threshold=float(z_soft),
+    )
     diag.update(pdict)
 
     return EventHit(epoch=epoch, kind="self_break", score=score, reason=reason), diag
@@ -919,6 +1261,19 @@ def main():
     )
     if self_hit is not None:
         events.append(self_hit)
+
+    # --- EPS component P + type labeling (NEW) ---
+    eps_diag = {}
+    try:
+        eps_diag = compute_eps_component_P(df, base, z_soft=z_soft, z_hard=z_hard)
+    except Exception as e:
+        print("[WARN] compute_eps_component_P failed:", repr(e))
+        eps_diag = {"error": str(e)}
+
+    # attach into diag.self (so summarize_p_direction can reuse without changing payload shape too much)
+    if diag_self is None:
+        diag_self = {}
+    diag_self.update(eps_diag)
 
     # diagnostic only (should not become FIRST BREAK)
     shock_hit = detect_self_shock(df, base_self, z_hard=z_hard, z_soft=z_soft)
