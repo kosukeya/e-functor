@@ -1,0 +1,32 @@
+{
+  "embedding": {
+    "method": "StandardScaler (PCA skipped)",
+    "emb_dim": 6,
+    "explained_variance_ratio": [],
+    "pca_skipped": true,
+    "pca_skip_reason": "n_samples < 2"
+  },
+  "features": {
+    "profile_cols_used": [
+      "attn_mean_3",
+      "attn_mean_4",
+      "attn_mean_5",
+      "attn_mass_0_2",
+      "attn_mass_3_5",
+      "y_mix_std",
+      "delta_ratio_sun_over_plant"
+    ],
+    "enverr_cols_used": [
+      "err_abs_mean",
+      "err_abs_p90",
+      "err_signed_mean",
+      "err_signed_min",
+      "err_signed_max",
+      "plant_mean",
+      "sun_mean",
+      "water_mean"
+    ],
+    "wide_columns_count": 45,
+    "pre_plus_delta_columns_count": 90
+  }
+}

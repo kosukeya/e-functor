@@ -1,0 +1,2 @@
+epoch,feature,threshold,left_rule,right_rule,left_class,right_class,accuracy,n_rows,val_island0,val_island1,threshold_prev,threshold_diff,abs_threshold_diff,is_event,event_sign
+200,err_abs_mean,0.0498880045488476,err_abs_mean <= 0.049888 -> class 0,err_abs_mean >  0.049888 -> class 1,0,1,1.0,2,0.0308542782800239,0.0689217303818017,0.1292986571788787,-0.07941065263003111,0.07941065263003111,True,-1
