@@ -1,7 +1,0 @@
-|--- delta_attn_mass_6_island0 <= -0.03
-|   |--- value: [0.16]
-|--- delta_attn_mass_6_island0 >  -0.03
-|   |--- delta_err_abs_mean_diff_0_minus_1 <= -0.00
-|   |   |--- value: [-0.03]
-|   |--- delta_err_abs_mean_diff_0_minus_1 >  -0.00
-|   |   |--- value: [0.01]
