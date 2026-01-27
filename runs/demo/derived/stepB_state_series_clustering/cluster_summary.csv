@@ -1,0 +1,3 @@
+cluster,n_traj,epoch_start_min,epoch_end_max
+0,2,200,1200
+1,4,600,2000

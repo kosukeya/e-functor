@@ -1,0 +1,5 @@
+LOO accuracy: 0.900000
+LOO ROC-AUC : 0.000000
+Confusion matrix [[TN, FP],[FN, TP]]:
+[[9 0]
+ [1 0]]

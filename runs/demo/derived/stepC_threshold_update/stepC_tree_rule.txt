@@ -1,0 +1,7 @@
+|--- delta_plant_mean_island1 <= -0.00
+|   |--- value: [0.04]
+|--- delta_plant_mean_island1 >  -0.00
+|   |--- delta_y_mix_mean_diff_0_minus_1 <= 0.01
+|   |   |--- value: [-0.00]
+|   |--- delta_y_mix_mean_diff_0_minus_1 >  0.01
+|   |   |--- value: [0.00]

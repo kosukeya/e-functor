@@ -1,0 +1,3 @@
+model,r2_loo,mae_loo,n_samples,n_features
+DecisionTreeRegressor(depth=2),-0.15572151161279013,0.013926874889336891,9,74
+RandomForestRegressor(depth=3),-0.2524007108303594,0.01586158357574217,9,74
