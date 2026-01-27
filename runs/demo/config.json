@@ -1,0 +1,44 @@
+{
+  "run": {
+    "run_id": "demo",
+    "run_dir": "C:\\Users\\yamas\\python\\e-functor\\runs\\demo"
+  },
+  "seed": 0,
+  "device": "cpu",
+  "data": {
+    "n": 5000,
+    "train_ratio": 0.8
+  },
+  "model": {
+    "d_model": 32,
+    "n_heads": 4
+  },
+  "train": {
+    "epochs": 2001,
+    "lr": 0.001,
+    "log_every": 200,
+    "tail_start": 801,
+    "tail_every": 50,
+    "island_every": 200,
+    "island_max_samples": 512,
+    "resume": false
+  },
+  "eps": {
+    "mode": "normal",
+    "eps_override": null,
+    "alpha_override": null,
+    "alpha_k": 5.0
+  },
+  "loss_multipliers": {
+    "mul_real": 1.0,
+    "mul_sem": 1.0,
+    "mul_cf": 1.0,
+    "mul_mono": 1.0,
+    "mul_cos": 1.0,
+    "mul_ent": 1.0,
+    "mul_env": 1.0,
+    "mul_self": 1.0
+  },
+  "self_target": 0.03,
+  "lr_table": "C:\\Users\\yamas\\python\\e-functor\\runs\\demo\\lr_mult_by_epoch.csv"
+}
