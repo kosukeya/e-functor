@@ -1,0 +1,42 @@
+{
+  "timestamp": "2026-01-27T15:33:04",
+  "command": [
+    "C:\\Users\\yamas\\python\\e-functor\\efunctor.py",
+    "pipeline",
+    "--run-id",
+    "demo2"
+  ],
+  "cwd": "C:\\Users\\yamas\\python\\e-functor",
+  "platform": "Windows-11-10.0.26100-SP0",
+  "versions": {
+    "python": "3.12.10",
+    "torch": "2.10.0+cpu",
+    "numpy": "2.4.1",
+    "pandas": "3.0.0",
+    "sklearn": "1.8.0",
+    "matplotlib": "3.10.8"
+  },
+  "env": {
+    "SEED": null,
+    "RUN_ID": null,
+    "RUN_DIR": null,
+    "RESUME": null,
+    "EPS_MODE": null,
+    "EPS_OVERRIDE": null,
+    "ALPHA_OVERRIDE": null,
+    "MUL_REAL": null,
+    "MUL_SEM": null,
+    "MUL_CF": null,
+    "MUL_MONO": null,
+    "MUL_COS": null,
+    "MUL_ENT": null,
+    "MUL_ENV": null,
+    "MUL_SELF": null,
+    "SELF_TARGET_OVERRIDE": null,
+    "ISLAND_EVERY": null,
+    "ISLAND_MAX_SAMPLES": null,
+    "TAIL_START": null,
+    "TAIL_EVERY": null,
+    "LR_TABLE": null
+  }
+}
